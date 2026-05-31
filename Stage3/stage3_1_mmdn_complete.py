@@ -1,36 +1,50 @@
 # -*- coding: utf-8 -*-
 """
-Stage 3.1 complete MMDN reproduction-oriented implementation.
+Stage 3.1 MMDN dynamic self-supervised tracking, tuned standalone version.
 
-This script implements a practical version of the multi-scale memory dynamic-learning
-network (MMDN) for speckle-to-pattern recovery:
+Purpose
+-------
+This script runs the Stage 3.1 MMDN-style dynamic input recovery experiment:
 
-1. fixed-state supervised pretraining without using future dynamic labels;
-2. frozen StaticNN baseline;
-3. three dynamic expert networks: S1, S2, and L3;
-4. confidence-weighted ensemble inference;
-5. self-supervised online update from pseudo-labels;
-6. alternating short-memory rebuild for S1/S2;
-7. long-memory replay update for L3;
-8. metrics, plots, pseudo-labels, spatial accuracy maps, and representative examples.
+    speckle image -> 16 x 16 input pattern
 
-Expected input files in DATA_DIR:
-- Either one or more .npz files containing arrays, or separate .npy files.
-- Required arrays: speckles, pattern/patterns.
-- Optional arrays: time_index, counts_by_time, kappa_by_time, kappa_per_sample.
+It is designed for the dataset folder containing files such as:
 
-Typical shapes:
-- speckles: (N, H, W), uint8/float32
-- patterns: (N, P), binary or gray-level targets, e.g. P = 256 for 16 x 16 patterns.
+    speckles.npy
+    pattern.npy
+    counts_by_time.npy
+    kappa_by_time.npy
+    kappa_per_sample.npy
+    time_index.npy
 
-Run:
-    python stage3_1_mmdn_complete.py
-    python stage3_1_mmdn_complete.py --data-dir "./mmdn_dynamic_1500m_16x16_100x100"
+Main features
+-------------
+1. Automatically finds the real dataset folder, including nested folders.
+2. Uses the lightweight CNN and Adadelta setup from Stage3_v1.ipynb by default.
+3. Exposes all important hyperparameters through argparse.
+4. Avoids future-label leakage by default through a fixed-state train/validation split.
+5. Can reproduce the legacy Stage3_v1 validation behavior if explicitly requested.
+6. Prints complete logs to terminal and also saves them to run_log.txt.
+7. Saves the same main figures as Stage3_v1.ipynb into a new folder named Stage3_1图片.
+8. Saves metrics, model weights, pseudo-labels, and training histories.
+9. Supports NVIDIA CUDA GPU acceleration, mixed precision AMP, channels-last tensors, and faster DataLoader settings.
 
-If DATA_DIR has no .npz/.npy files, the script automatically searches immediate
-subfolders and prefers folders whose names contain "mmdn_dynamic".
+Recommended run from the MMF root directory
+-------------------------------------------
+    python stage3_1_mmdn_tuned_full.py
 
-Outputs are saved under OUTPUT_DIR.
+Or explicitly specify the dataset folder
+----------------------------------------
+    python stage3_1_mmdn_tuned_full.py --data-dir "./mmdn_dynamic_1500m_16x16_100x100"
+
+Fast test run
+-------------
+    python stage3_1_mmdn_tuned_full.py --pretrain-epochs 3 --update-epochs 1 --chunk-size 1000
+
+Legacy Stage3_v1-like run, not recommended for formal reporting because it uses
+first dynamic-state true labels for validation during pretraining
+--------------------------------------------------------------------------
+    python stage3_1_mmdn_tuned_full.py --pretrain-val-mode first_dynamic --fixed-eval-mode train_tail
 """
 
 from __future__ import annotations
@@ -39,12 +53,16 @@ import argparse
 import copy
 import json
 import math
+import os
 import random
+import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -55,172 +73,240 @@ from torch.utils.data import DataLoader, Dataset
 
 
 # ============================================================
-# 1. Configuration
+# 1. Hyperparameter configuration
 # ============================================================
+
 
 @dataclass
 class Config:
+    # Paths
+    data_dir: str = "."
+    output_dir: Optional[str] = None
+    output_folder_name: str = "Stage3_1图片"
+    preferred_dataset_name: str = "mmdn_dynamic_1500m_16x16_100x100"
+
+    # Reproducibility
     seed: int = 42
 
-    # Use Path.cwd() when this script is placed in the dataset directory.
-    data_dir: str = "."
-    output_dir: str = "mmdn_stage3_1_complete_outputs"
-
-    # Data controls. None means inferred from arrays or metadata.
+    # Data controls
     speckle_dim: Optional[int] = None
+    normalize_speckles: bool = True
     pretrain_samples: Optional[int] = None
     samples_per_dynamic_state: Optional[int] = None
     limit_dynamic_states: Optional[int] = None
-    normalize_speckles: bool = True
-    per_sample_standardize: bool = False
+    pretrain_val_ratio: float = 0.10
+    pretrain_val_mode: str = "holdout"  # holdout, first_dynamic, none
+    fixed_eval_mode: str = "holdout"    # holdout, train_tail
+    fixed_eval_count: int = 10000
+
+    # Model hyperparameters, Stage3_v1-like by default
+    base_channels: int = 8
+    dropout: float = 0.40
     graylevel: int = 2
 
-    # Train/validation split inside the initial fixed-state segment only.
-    pretrain_val_fraction: float = 0.10
-
-    # Online interval. If your dynamic segment is 5000 samples and this is 1000,
-    # every segment is split into five 10-s-like online intervals.
-    dynamic_chunk_size: Optional[int] = 1000
-
-    # Optimization.
+    # Optimization
     batch_size: int = 128
+    pretrain_epochs: int = 40
+    update_epochs: int = 20
+    early_stop_patience: int = 6
+    learning_rate: float = 0.10
+    optimizer: str = "adadelta"  # adadelta, adamw, adam
+    weight_decay: float = 0.0
     num_workers: int = 0
-    pretrain_epochs: int = 60
-    update_epochs: int = 8
-    rebuild_epochs: int = 12
-    early_stop_patience: int = 8
-    lr: float = 2e-4
-    weight_decay: float = 1e-4
-    grad_clip_norm: float = 5.0
 
-    # Model.
-    model_width: int = 24
-    dropout: float = 0.15
+    # GPU / acceleration controls
+    device: str = "auto"          # auto, cuda, cpu
+    use_amp: bool = True           # mixed precision on CUDA
+    amp_dtype: str = "float16"     # float16 or bfloat16
+    channels_last: bool = True     # use NHWC memory format on CUDA for Conv2d
+    pin_memory: bool = True        # faster CPU -> GPU transfer
+    persistent_workers: bool = True
+    prefetch_factor: int = 2
+    cudnn_benchmark: bool = True
+    deterministic: bool = False
+    compile_model: bool = False    # optional torch.compile; default off for stability
 
-    # Memory logic.
-    # S1/S2 are rebuilt alternately every rebuild_interval online updates.
+    # Dynamic online tracking
+    chunk_size: int = 1000
+    update_train_window: Optional[int] = None
     rebuild_interval: int = 5
-    short_memory_chunks: int = 3
-    long_memory_limit: Optional[int] = None
-    anchor_samples_for_l3: int = 12000
-    l3_replay_pseudo_samples: int = 12000
-    short_replay_samples: int = 6000
+    memory_limit: Optional[int] = None
 
-    # Pseudo-label controls.
-    use_soft_pseudo_labels: bool = False
-    pseudo_conf_threshold: float = 0.72
-    min_pseudo_keep_fraction: float = 0.35
-    ensemble_temperature: float = 8.0
+    # Pseudo-label filtering. Default 0.0 reproduces Stage3_v1 behavior: keep all pseudo-labels.
+    pseudo_sample_threshold: float = 0.0
+    min_pseudo_keep_ratio: float = 0.0
 
-    # Evaluation / plotting.
-    max_eval_samples_per_chunk: Optional[int] = None
-    save_example_every: int = 999999  # normally only selected examples are saved later
+    # Confidence ensemble
+    confidence_scale: float = 1.8
+    confidence_bias: float = 0.1
+    confidence_weight_gain: float = 10.0
+
+    # Evaluation and saving
+    save_pseudo_labels: bool = True
+    save_models: bool = True
+    save_example_images: bool = True
     example_count: int = 8
 
+    # If true, dynamic-stage true labels can be used as validation labels during online update.
+    # Keep false for a clean self-supervised protocol.
+    use_true_labels_for_dynamic_early_stopping: bool = False
 
-CFG = Config()
+
+def str2bool(value: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    value = value.lower().strip()
+    if value in {"1", "true", "yes", "y", "on"}:
+        return True
+    if value in {"0", "false", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Cannot parse boolean value: {value}")
+
+
+def parse_args() -> Config:
+    parser = argparse.ArgumentParser(
+        description="Stage 3.1 MMDN dynamic self-supervised tracking, tuned full version."
+    )
+
+    # Paths
+    parser.add_argument("--data-dir", type=str, default=Config.data_dir)
+    parser.add_argument("--output-dir", type=str, default=Config.output_dir)
+    parser.add_argument("--output-folder-name", type=str, default=Config.output_folder_name)
+    parser.add_argument("--preferred-dataset-name", type=str, default=Config.preferred_dataset_name)
+
+    # Reproducibility
+    parser.add_argument("--seed", type=int, default=Config.seed)
+
+    # Data controls
+    parser.add_argument("--speckle-dim", type=int, default=Config.speckle_dim)
+    parser.add_argument("--normalize-speckles", type=str2bool, default=Config.normalize_speckles)
+    parser.add_argument("--pretrain-samples", type=int, default=Config.pretrain_samples)
+    parser.add_argument("--samples-per-dynamic-state", type=int, default=Config.samples_per_dynamic_state)
+    parser.add_argument("--limit-dynamic-states", type=int, default=Config.limit_dynamic_states)
+    parser.add_argument("--pretrain-val-ratio", type=float, default=Config.pretrain_val_ratio)
+    parser.add_argument(
+        "--pretrain-val-mode",
+        type=str,
+        choices=["holdout", "first_dynamic", "none"],
+        default=Config.pretrain_val_mode,
+    )
+    parser.add_argument(
+        "--fixed-eval-mode",
+        type=str,
+        choices=["holdout", "train_tail"],
+        default=Config.fixed_eval_mode,
+    )
+    parser.add_argument("--fixed-eval-count", type=int, default=Config.fixed_eval_count)
+
+    # Model
+    parser.add_argument("--base-channels", type=int, default=Config.base_channels)
+    parser.add_argument("--dropout", type=float, default=Config.dropout)
+    parser.add_argument("--graylevel", type=int, default=Config.graylevel)
+
+    # Optimization
+    parser.add_argument("--batch-size", type=int, default=Config.batch_size)
+    parser.add_argument("--pretrain-epochs", type=int, default=Config.pretrain_epochs)
+    parser.add_argument("--update-epochs", type=int, default=Config.update_epochs)
+    parser.add_argument("--early-stop-patience", type=int, default=Config.early_stop_patience)
+    parser.add_argument("--learning-rate", type=float, default=Config.learning_rate)
+    parser.add_argument("--optimizer", type=str, choices=["adadelta", "adamw", "adam"], default=Config.optimizer)
+    parser.add_argument("--weight-decay", type=float, default=Config.weight_decay)
+    parser.add_argument("--num-workers", type=int, default=Config.num_workers)
+
+    # GPU / acceleration controls
+    parser.add_argument("--device", type=str, choices=["auto", "cuda", "cpu"], default=Config.device)
+    parser.add_argument("--use-amp", type=str2bool, default=Config.use_amp)
+    parser.add_argument("--amp-dtype", type=str, choices=["float16", "bfloat16"], default=Config.amp_dtype)
+    parser.add_argument("--channels-last", type=str2bool, default=Config.channels_last)
+    parser.add_argument("--pin-memory", type=str2bool, default=Config.pin_memory)
+    parser.add_argument("--persistent-workers", type=str2bool, default=Config.persistent_workers)
+    parser.add_argument("--prefetch-factor", type=int, default=Config.prefetch_factor)
+    parser.add_argument("--cudnn-benchmark", type=str2bool, default=Config.cudnn_benchmark)
+    parser.add_argument("--deterministic", type=str2bool, default=Config.deterministic)
+    parser.add_argument("--compile-model", type=str2bool, default=Config.compile_model)
+
+    # Dynamic tracking
+    parser.add_argument("--chunk-size", type=int, default=Config.chunk_size)
+    parser.add_argument("--update-train-window", type=int, default=Config.update_train_window)
+    parser.add_argument("--rebuild-interval", type=int, default=Config.rebuild_interval)
+    parser.add_argument("--memory-limit", type=int, default=Config.memory_limit)
+    parser.add_argument("--pseudo-sample-threshold", type=float, default=Config.pseudo_sample_threshold)
+    parser.add_argument("--min-pseudo-keep-ratio", type=float, default=Config.min_pseudo_keep_ratio)
+
+    # Confidence ensemble
+    parser.add_argument("--confidence-scale", type=float, default=Config.confidence_scale)
+    parser.add_argument("--confidence-bias", type=float, default=Config.confidence_bias)
+    parser.add_argument("--confidence-weight-gain", type=float, default=Config.confidence_weight_gain)
+
+    # Saving
+    parser.add_argument("--save-pseudo-labels", type=str2bool, default=Config.save_pseudo_labels)
+    parser.add_argument("--save-models", type=str2bool, default=Config.save_models)
+    parser.add_argument("--save-example-images", type=str2bool, default=Config.save_example_images)
+    parser.add_argument("--example-count", type=int, default=Config.example_count)
+    parser.add_argument(
+        "--use-true-labels-for-dynamic-early-stopping",
+        type=str2bool,
+        default=Config.use_true_labels_for_dynamic_early_stopping,
+    )
+
+    args = parser.parse_args()
+    return Config(**vars(args))
 
 
 # ============================================================
-# 2. Utilities
+# 2. Logging utilities
 # ============================================================
 
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.benchmark = True
+
+class Tee:
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for stream in self.streams:
+            stream.write(data)
+            stream.flush()
+
+    def flush(self):
+        for stream in self.streams:
+            stream.flush()
+
+
+def setup_output_and_logging(cfg: Config, requested_data_dir: Path) -> Path:
+    if cfg.output_dir is not None:
+        output_dir = Path(cfg.output_dir).expanduser().resolve()
+    else:
+        output_dir = requested_data_dir / cfg.output_folder_name
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "models").mkdir(exist_ok=True)
+    (output_dir / "pseudo_labels").mkdir(exist_ok=True)
+    (output_dir / "training_logs").mkdir(exist_ok=True)
+    (output_dir / "figures").mkdir(exist_ok=True)
+
+    log_path = output_dir / "run_log.txt"
+    log_file = open(log_path, "w", encoding="utf-8")
+    sys.stdout = Tee(sys.__stdout__, log_file)
+    sys.stderr = Tee(sys.__stderr__, log_file)
+    return output_dir
+
+
+# ============================================================
+# 3. Dataset loading
+# ============================================================
 
 
 def canonical_name(name: str) -> str:
     return name.lower().replace("-", "_").replace(" ", "_")
 
 
-def has_np_dataset_files(path: Path) -> bool:
-    return any(path.glob("*.npz")) or any(path.glob("*.npy"))
-
-
-def dataset_dir_score(path: Path) -> Tuple[int, str]:
-    """Rank candidate dataset folders. Smaller score is better."""
-    name = canonical_name(path.name)
-    score = 100
-    if "mmdn_dynamic" in name:
-        score -= 50
-    if "16x16" in name:
-        score -= 15
-    if "100x100" in name:
-        score -= 15
-    if "output" in name or "outputs" in name:
-        score += 80
-    return score, str(path).lower()
-
-
-def find_dataset_dirs(root: Path) -> List[Path]:
-    """Find folders that directly contain .npz/.npy arrays."""
-    candidates: List[Path] = []
-
-    if has_np_dataset_files(root):
-        candidates.append(root)
-
-    # First search immediate children. This avoids accidentally scanning old outputs deeply.
-    for child in sorted(root.iterdir() if root.exists() else []):
-        if child.is_dir() and has_np_dataset_files(child):
-            candidates.append(child)
-
-    # If still nothing is found, search recursively.
-    if not candidates and root.exists():
-        seen = set()
-        for file_path in list(root.rglob("*.npz")) + list(root.rglob("*.npy")):
-            parent = file_path.parent.resolve()
-            if parent not in seen:
-                seen.add(parent)
-                candidates.append(parent)
-
-    # Remove output folders unless they are the only possible folders.
-    non_output = [p for p in candidates if "output" not in canonical_name(p.name)]
-    if non_output:
-        candidates = non_output
-
-    candidates = sorted(set(candidates), key=dataset_dir_score)
-    return candidates
-
-
-def resolve_dataset_dir(requested_dir: Path) -> Path:
-    """Resolve the actual dataset directory.
-
-    If the requested directory directly contains arrays, use it.
-    Otherwise, search subfolders and prefer the real MMF dataset folder.
-    """
-    requested_dir = requested_dir.expanduser().resolve()
-    if not requested_dir.exists():
-        raise FileNotFoundError(f"DATA_DIR does not exist: {requested_dir}")
-
-    if has_np_dataset_files(requested_dir):
-        return requested_dir
-
-    candidates = find_dataset_dirs(requested_dir)
-    if not candidates:
-        raise FileNotFoundError(
-            f"No .npz or .npy dataset files found in {requested_dir} or its subfolders."
-        )
-
-    # Use the best-ranked candidate automatically.
-    best = candidates[0].resolve()
-    print("No .npz/.npy files were found directly in DATA_DIR.")
-    print("Automatically selected dataset subfolder:", best)
-    if len(candidates) > 1:
-        print("Other candidate data folders:")
-        for cand in candidates[1:8]:
-            print("  -", cand)
-    return best
-
-
 def load_arrays_from_npz(data_dir: Path) -> Dict[str, np.ndarray]:
     arrays: Dict[str, np.ndarray] = {}
     for npz_path in sorted(data_dir.glob("*.npz")):
-        archive = np.load(npz_path, allow_pickle=False)
+        try:
+            archive = np.load(npz_path, allow_pickle=False)
+        except Exception as exc:
+            print(f"Warning: failed to load npz {npz_path}: {exc}")
+            continue
         for key in archive.files:
             arrays[canonical_name(key)] = archive[key]
         if len(archive.files) == 1:
@@ -228,54 +314,127 @@ def load_arrays_from_npz(data_dir: Path) -> Dict[str, np.ndarray]:
     return arrays
 
 
-def load_arrays_from_npy(data_dir: Path) -> Dict[str, np.ndarray]:
+def load_arrays_from_npy(data_dir: Path, mmap: bool = True) -> Dict[str, np.ndarray]:
     arrays: Dict[str, np.ndarray] = {}
     for npy_path in sorted(data_dir.glob("*.npy")):
-        arrays[canonical_name(npy_path.stem)] = np.load(npy_path, mmap_mode="r")
+        try:
+            arrays[canonical_name(npy_path.stem)] = np.load(npy_path, mmap_mode="r" if mmap else None)
+        except Exception as exc:
+            print(f"Warning: failed to load npy {npy_path}: {exc}")
     return arrays
 
 
-def pick_array(
-    arrays: Dict[str, np.ndarray],
-    candidates: Sequence[str],
-    required: bool = True,
-) -> Optional[np.ndarray]:
+def load_arrays_direct(data_dir: Path) -> Tuple[Dict[str, np.ndarray], str]:
+    arrays = load_arrays_from_npz(data_dir)
+    if arrays:
+        return arrays, "npz"
+    arrays = load_arrays_from_npy(data_dir)
+    if arrays:
+        return arrays, "npy"
+    return {}, "none"
+
+
+def contains_required_arrays(arrays: Dict[str, np.ndarray]) -> bool:
+    keys = set(arrays.keys())
+    speckle_names = {"speckles", "speckle", "x", "inputs"}
+    pattern_names = {"pattern", "patterns", "y", "labels", "targets"}
+    return bool(keys & speckle_names) and bool(keys & pattern_names)
+
+
+def find_dataset_dir(requested_dir: Path, preferred_name: str) -> Tuple[Path, Dict[str, np.ndarray], str]:
+    arrays, source_kind = load_arrays_direct(requested_dir)
+    if contains_required_arrays(arrays):
+        print("Dataset files found directly in DATA_DIR.")
+        return requested_dir, arrays, source_kind
+
+    print("No complete .npz/.npy dataset was found directly in DATA_DIR.")
+    print("Searching subfolders recursively...")
+
+    candidate_dirs: List[Path] = []
+    for root, dirs, files in os.walk(requested_dir):
+        root_path = Path(root)
+        if root_path.name in {"models", "pseudo_labels", "training_logs", "figures", "__pycache__"}:
+            continue
+        if any(str(file).lower().endswith((".npz", ".npy")) for file in files):
+            candidate_dirs.append(root_path)
+
+    def score_dir(path: Path) -> Tuple[int, int, str]:
+        name = path.name.lower()
+        preferred = preferred_name.lower()
+        score = 0
+        if preferred and preferred in name:
+            score -= 1000
+        if "mmdn" in name:
+            score -= 100
+        if "dynamic" in name:
+            score -= 50
+        if "output" in name or "outputs" in name:
+            score += 200
+        depth = len(path.relative_to(requested_dir).parts) if path != requested_dir else 0
+        return score, depth, str(path)
+
+    candidate_dirs = sorted(set(candidate_dirs), key=score_dir)
+    for candidate in candidate_dirs:
+        arrays, source_kind = load_arrays_direct(candidate)
+        if contains_required_arrays(arrays):
+            print(f"Automatically selected dataset subfolder: {candidate}")
+            return candidate, arrays, source_kind
+
+    raise FileNotFoundError(
+        f"Could not find a dataset folder containing speckles and pattern arrays under {requested_dir}."
+    )
+
+
+def pick_array(arrays: Dict[str, np.ndarray], candidates: Sequence[str], required: bool = True):
     for name in candidates:
         key = canonical_name(name)
         if key in arrays:
             return arrays[key]
     if required:
-        raise KeyError(
-            f"Could not find any of these arrays: {list(candidates)}. "
-            f"Available keys: {sorted(arrays.keys())}"
-        )
+        raise KeyError(f"Could not find any of these arrays: {candidates}. Available keys: {sorted(arrays)}")
     return None
 
 
+def load_metadata(actual_data_dir: Path) -> dict:
+    metadata_path = actual_data_dir / "metadata.json"
+    if metadata_path.exists():
+        try:
+            return json.loads(metadata_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"Warning: failed to read metadata.json: {exc}")
+    return {}
+
+
+# ============================================================
+# 4. Segment inference
+# ============================================================
+
+
 def infer_segments(
-    n_samples: int,
+    patterns: np.ndarray,
     time_index: Optional[np.ndarray],
     counts_by_time: Optional[np.ndarray],
-    metadata: Dict,
+    metadata: dict,
     cfg: Config,
-) -> List[Dict[str, int]]:
+) -> List[dict]:
+    n = int(patterns.shape[0])
     if counts_by_time is not None:
-        counts = np.asarray(counts_by_time).astype(int).tolist()
+        counts = np.asarray(counts_by_time).astype(int).reshape(-1).tolist()
     elif time_index is not None:
         unique, counts_arr = np.unique(np.asarray(time_index), return_counts=True)
         order = np.argsort(unique)
         counts = counts_arr[order].astype(int).tolist()
     else:
-        hint = metadata.get("mmdn_training_hint", {})
-        pre = int(cfg.pretrain_samples or hint.get("sizeOfPretrain", n_samples // 2))
-        interval = int(cfg.samples_per_dynamic_state or hint.get("sizeOfUpdateInvertal", max(1, n_samples - pre)))
-        dyn = max(0, (n_samples - pre) // interval)
+        hint = metadata.get("mmdn_training_hint", {}) if isinstance(metadata, dict) else {}
+        pre = int(cfg.pretrain_samples or hint.get("sizeOfPretrain", n // 2))
+        interval = int(cfg.samples_per_dynamic_state or hint.get("sizeOfUpdateInvertal", max(1, n - pre)))
+        dyn = max(0, (n - pre) // interval)
         counts = [pre] + [interval] * dyn
 
-    if sum(counts) > n_samples:
-        raise ValueError(f"Segment counts sum to {sum(counts)}, but only {n_samples} samples exist.")
+    if sum(counts) > n:
+        raise ValueError(f"Segment counts sum to {sum(counts)}, but only {n} samples exist.")
 
-    segments: List[Dict[str, int]] = []
+    segments: List[dict] = []
     start = 0
     for state_id, count in enumerate(counts):
         stop = start + int(count)
@@ -283,62 +442,40 @@ def infer_segments(
         start = stop
 
     if cfg.limit_dynamic_states is not None:
-        segments = [segments[0]] + segments[1:1 + int(cfg.limit_dynamic_states)]
+        segments = [segments[0]] + segments[1 : 1 + int(cfg.limit_dynamic_states)]
 
     if cfg.pretrain_samples is not None:
         segments[0]["stop"] = segments[0]["start"] + int(cfg.pretrain_samples)
         segments[0]["count"] = int(cfg.pretrain_samples)
 
     if cfg.samples_per_dynamic_state is not None:
-        base = segments[0]["stop"]
+        base = int(segments[0]["stop"])
         updated = [segments[0]]
         for i, old in enumerate(segments[1:], start=1):
             start = base + (i - 1) * int(cfg.samples_per_dynamic_state)
-            stop = min(start + int(cfg.samples_per_dynamic_state), n_samples)
-            if start < stop:
-                updated.append({"state": old["state"], "start": start, "stop": stop, "count": stop - start})
+            stop = start + int(cfg.samples_per_dynamic_state)
+            if stop > n:
+                break
+            updated.append({"state": old["state"], "start": start, "stop": stop, "count": stop - start})
         segments = updated
+
+    if len(segments) < 2:
+        raise ValueError("Need one pretraining segment plus at least one dynamic segment.")
 
     return segments
 
 
-def indices_for_segment(seg: Dict[str, int]) -> np.ndarray:
-    return np.arange(int(seg["start"]), int(seg["stop"]), dtype=np.int64)
-
-
-def split_train_val(indices: np.ndarray, val_fraction: float, seed: int) -> Tuple[np.ndarray, np.ndarray]:
-    indices = np.asarray(indices, dtype=np.int64)
-    rng = np.random.default_rng(seed)
-    perm = rng.permutation(indices)
-    n_val = max(1, int(round(len(indices) * val_fraction)))
-    val_idx = np.sort(perm[:n_val])
-    train_idx = np.sort(perm[n_val:])
-    return train_idx, val_idx
-
-
-def split_dynamic_indices(indices: np.ndarray, chunk_size: Optional[int]) -> List[np.ndarray]:
-    if chunk_size is None or int(chunk_size) <= 0 or len(indices) <= int(chunk_size):
-        return [indices]
-    chunk_size = int(chunk_size)
-    return [indices[i:i + chunk_size] for i in range(0, len(indices), chunk_size)]
-
-
-def infer_side_length(outsize: int) -> Optional[int]:
-    side = int(round(math.sqrt(outsize)))
-    return side if side * side == outsize else None
-
-
-def safe_sample(indices: np.ndarray, n: int, seed: int) -> np.ndarray:
-    indices = np.asarray(indices, dtype=np.int64)
-    if len(indices) <= n:
-        return indices
-    rng = np.random.default_rng(seed)
-    return np.sort(rng.choice(indices, size=n, replace=False))
+def make_segment_dataframe(segments: List[dict], kappa_by_time: Optional[np.ndarray]) -> pd.DataFrame:
+    df = pd.DataFrame(segments)
+    if kappa_by_time is not None and len(kappa_by_time) >= len(df):
+        df["kappa"] = np.asarray(kappa_by_time).reshape(-1)[: len(df)].astype(float)
+    return df
 
 
 # ============================================================
-# 3. Dataset and target processing
+# 5. Dataset and model
 # ============================================================
+
 
 class MMFDataset(Dataset):
     def __init__(
@@ -348,27 +485,27 @@ class MMFDataset(Dataset):
         labels: Optional[np.ndarray] = None,
         speckle_dim: Optional[int] = None,
         normalize: bool = True,
-        per_sample_standardize: bool = False,
     ):
         self.x_array = x_array
         self.sample_indices = np.asarray(sample_indices, dtype=np.int64)
         self.labels = None if labels is None else np.asarray(labels, dtype=np.float32)
         self.speckle_dim = speckle_dim
         self.normalize = normalize
-        self.per_sample_standardize = per_sample_standardize
 
-    def __len__(self) -> int:
+        if self.labels is not None and len(self.labels) != len(self.sample_indices):
+            raise ValueError(
+                f"labels length {len(self.labels)} does not match sample_indices length {len(self.sample_indices)}"
+            )
+
+    def __len__(self):
         return len(self.sample_indices)
 
     def __getitem__(self, pos: int):
         sample_id = int(self.sample_indices[pos])
         x = np.asarray(self.x_array[sample_id], dtype=np.float32)
         if self.normalize:
-            # Support both uint8 [0,255] and float [0,1] datasets.
-            if np.nanmax(x) > 2.0:
+            if x.max() > 2.0:
                 x = x / 255.0
-        if self.per_sample_standardize:
-            x = (x - float(np.mean(x))) / (float(np.std(x)) + 1e-6)
         x_tensor = torch.from_numpy(x).unsqueeze(0)
         if self.speckle_dim is not None and (
             x_tensor.shape[-2] != self.speckle_dim or x_tensor.shape[-1] != self.speckle_dim
@@ -376,938 +513,1092 @@ class MMFDataset(Dataset):
             x_tensor = F.interpolate(
                 x_tensor.unsqueeze(0),
                 size=(self.speckle_dim, self.speckle_dim),
-                mode="bilinear",
-                align_corners=False,
+                mode="nearest",
             ).squeeze(0)
+
         if self.labels is None:
             return x_tensor
         y = torch.from_numpy(self.labels[pos])
         return x_tensor, y
 
 
-def normalize_targets(patterns: np.ndarray, graylevel: int) -> np.ndarray:
-    y = np.asarray(patterns)
-    if graylevel == 2:
-        if y.max() > 1:
-            y = (y > 0).astype(np.float32)
-        else:
-            y = y.astype(np.float32)
-        return y
-    y = y.astype(np.float32)
-    max_val = float(graylevel - 1)
-    if y.max() > 1.0:
-        y = y / max_val
-    return np.clip(y, 0.0, 1.0).astype(np.float32)
-
-
-def labels_for_indices(targets: np.ndarray, indices: Sequence[int]) -> np.ndarray:
-    return np.asarray(targets[np.asarray(indices, dtype=np.int64)], dtype=np.float32)
-
-
-def make_loader(
-    speckles: np.ndarray,
-    indices: Sequence[int],
-    labels: Optional[np.ndarray],
-    speckle_dim: int,
-    cfg: Config,
-    shuffle: bool,
-    batch_size: Optional[int] = None,
-) -> DataLoader:
-    dataset = MMFDataset(
-        speckles,
-        indices,
-        labels=labels,
-        speckle_dim=speckle_dim,
-        normalize=cfg.normalize_speckles,
-        per_sample_standardize=cfg.per_sample_standardize,
-    )
-    return DataLoader(
-        dataset,
-        batch_size=int(batch_size or cfg.batch_size),
-        shuffle=shuffle,
-        num_workers=int(cfg.num_workers),
-        pin_memory=torch.cuda.is_available(),
-        drop_last=False,
-    )
-
-
-# ============================================================
-# 4. Model
-# ============================================================
-
-class ConvBlock(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, stride: int, dropout: float):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=stride, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
-            nn.SiLU(inplace=True),
-            nn.Dropout2d(dropout),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
-
 class MMDNSubNetwork(nn.Module):
-    def __init__(self, outsize: int, speckle_dim: int, width: int = 24, dropout: float = 0.15):
+    def __init__(self, outsize: int, speckle_dim: int, base_channels: int = 8, dropout: float = 0.4):
         super().__init__()
-        w = int(width)
+        c = int(base_channels)
         self.features = nn.Sequential(
-            ConvBlock(1, w, stride=2, dropout=dropout),
-            ConvBlock(w, 2 * w, stride=2, dropout=dropout),
-            ConvBlock(2 * w, 4 * w, stride=2, dropout=dropout),
-            ConvBlock(4 * w, 4 * w, stride=1, dropout=dropout),
-            nn.AdaptiveAvgPool2d((6, 6)),
+            nn.Conv2d(1, c, kernel_size=3),
+            nn.BatchNorm2d(c),
+            nn.ReLU(inplace=True),
+            nn.Dropout(float(dropout)),
+            nn.Conv2d(c, c, kernel_size=3, stride=2),
+            nn.BatchNorm2d(c),
+            nn.ReLU(inplace=True),
+            nn.Dropout(float(dropout)),
         )
-        self.head = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(4 * w * 6 * 6, 512),
-            nn.SiLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(512, outsize),
-        )
+        with torch.no_grad():
+            dummy = torch.zeros(1, 1, speckle_dim, speckle_dim)
+            flat_dim = int(np.prod(self.features(dummy).shape[1:]))
+        self.classifier = nn.Linear(flat_dim, outsize)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.head(self.features(x))
-
-
-def new_model(outsize: int, speckle_dim: int, cfg: Config, device: torch.device) -> nn.Module:
-    return MMDNSubNetwork(outsize, speckle_dim, cfg.model_width, cfg.dropout).to(device)
-
-
-def make_optimizer(model: nn.Module, cfg: Config) -> torch.optim.Optimizer:
-    return torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+        x = self.features(x)
+        x = torch.flatten(x, start_dim=1)
+        return self.classifier(x)
 
 
 # ============================================================
-# 5. Inference, confidence, metrics
+# 6. Training, prediction, metrics
 # ============================================================
 
-def binarize_prob(prob: np.ndarray, graylevel: int) -> np.ndarray:
-    prob = np.clip(np.asarray(prob), 0.0, 1.0)
-    if graylevel == 2:
-        return (prob >= 0.5).astype(np.float32)
-    levels = graylevel - 1
-    return (np.rint(prob * levels) / levels).astype(np.float32)
+
+def choose_device(cfg: Config) -> torch.device:
+    if cfg.device == "cpu":
+        return torch.device("cpu")
+    if cfg.device == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "--device cuda was requested, but torch.cuda.is_available() is False. "
+                "Install a CUDA-enabled PyTorch build and check your NVIDIA driver."
+            )
+        return torch.device("cuda")
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def confidence_per_sample(prob: np.ndarray) -> np.ndarray:
-    prob = np.asarray(prob, dtype=np.float32)
-    return np.mean(np.abs(prob - 0.5) * 2.0, axis=1)
+def get_amp_dtype(cfg: Config):
+    if cfg.amp_dtype == "bfloat16":
+        return torch.bfloat16
+    return torch.float16
 
 
-def expert_weight_from_confidences(conf_means: Sequence[float], temperature: float) -> np.ndarray:
-    logits = np.asarray(conf_means, dtype=np.float64) * float(temperature)
-    logits = logits - np.max(logits)
-    w = np.exp(logits)
-    return w / np.sum(w)
+def move_x_to_device(x: torch.Tensor, device: torch.device, channels_last: bool) -> torch.Tensor:
+    x = x.to(device, non_blocking=True)
+    if channels_last and device.type == "cuda" and x.ndim == 4:
+        x = x.contiguous(memory_format=torch.channels_last)
+    return x
 
 
-def predict_prob(
-    model: nn.Module,
-    speckles: np.ndarray,
-    indices: Sequence[int],
-    speckle_dim: int,
-    cfg: Config,
-    device: torch.device,
-) -> np.ndarray:
-    model.eval()
-    loader = make_loader(speckles, indices, labels=None, speckle_dim=speckle_dim, cfg=cfg, shuffle=False)
-    preds: List[np.ndarray] = []
-    with torch.no_grad():
-        for x in loader:
-            x = x.to(device, non_blocking=True)
-            pred = torch.sigmoid(model(x)).detach().cpu().numpy()
-            preds.append(pred)
-    return np.concatenate(preds, axis=0)
+class Experiment:
+    def __init__(
+        self,
+        cfg: Config,
+        output_dir: Path,
+        speckles: np.ndarray,
+        patterns: np.ndarray,
+        segments: List[dict],
+        kappa_by_time: Optional[np.ndarray],
+        kappa_per_sample: Optional[np.ndarray],
+        speckle_dim: int,
+    ):
+        self.cfg = cfg
+        self.output_dir = output_dir
+        self.speckles = speckles
+        self.patterns = patterns
+        self.segments = segments
+        self.kappa_by_time = kappa_by_time
+        self.kappa_per_sample = kappa_per_sample
+        self.speckle_dim = int(speckle_dim)
+        self.outsize = int(patterns.shape[1])
+        self.pattern_side = int(round(math.sqrt(self.outsize)))
+        self.device = choose_device(cfg)
+        self.use_amp = bool(cfg.use_amp and self.device.type == "cuda")
+        self.amp_dtype = get_amp_dtype(cfg)
+        self.channels_last = bool(cfg.channels_last and self.device.type == "cuda")
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
 
+        self.clf1 = self.new_model()
+        self.clf2 = self.new_model()
+        self.clf3 = self.new_model()
+        self.optimizers = {
+            "clf1": self.make_optimizer(self.clf1),
+            "clf2": self.make_optimizer(self.clf2),
+            "clf3": self.make_optimizer(self.clf3),
+        }
+        self.static_clf3: Optional[nn.Module] = None
 
-def ensemble_predict(
-    models: Dict[str, nn.Module],
-    speckles: np.ndarray,
-    indices: Sequence[int],
-    speckle_dim: int,
-    cfg: Config,
-    device: torch.device,
-) -> Tuple[np.ndarray, np.ndarray, Dict[str, np.ndarray], Dict[str, float], Dict[str, float]]:
-    probs = {
-        "s1": predict_prob(models["s1"], speckles, indices, speckle_dim, cfg, device),
-        "s2": predict_prob(models["s2"], speckles, indices, speckle_dim, cfg, device),
-        "l3": predict_prob(models["l3"], speckles, indices, speckle_dim, cfg, device),
-    }
-    conf = {name: float(np.mean(confidence_per_sample(prob))) for name, prob in probs.items()}
-    w_arr = expert_weight_from_confidences([conf["s1"], conf["s2"], conf["l3"]], cfg.ensemble_temperature)
-    weights = {"s1": float(w_arr[0]), "s2": float(w_arr[1]), "l3": float(w_arr[2])}
-    prob_ens = weights["s1"] * probs["s1"] + weights["s2"] * probs["s2"] + weights["l3"] * probs["l3"]
-    pred_ens = binarize_prob(prob_ens, cfg.graylevel)
-    return pred_ens, prob_ens, probs, conf, weights
+    def indices_for_segment(self, seg: dict) -> np.ndarray:
+        return np.arange(int(seg["start"]), int(seg["stop"]), dtype=np.int64)
 
+    def labels_for_indices(self, indices: Sequence[int]) -> np.ndarray:
+        return np.asarray(self.patterns[np.asarray(indices, dtype=np.int64)], dtype=np.uint8)
 
-def evaluate_prediction(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
-    y_true = np.asarray(y_true, dtype=np.float32)
-    y_pred = np.asarray(y_pred, dtype=np.float32)
-    correct = np.isclose(y_true, y_pred)
-    sample_acc = np.mean(correct, axis=1) * 100.0
-    errors_per_sample = np.sum(~correct, axis=1)
-    return {
-        "pixel_accuracy": float(np.mean(correct) * 100.0),
-        "bit_error_rate": float(1.0 - np.mean(correct)),
-        "sample_accuracy_mean": float(np.mean(sample_acc)),
-        "sample_accuracy_std": float(np.std(sample_acc)),
-        "exact_match_percent": float(np.mean(np.all(correct, axis=1)) * 100.0),
-        "mae": float(np.mean(np.abs(y_true - y_pred))),
-        "mean_error_pixels": float(np.mean(errors_per_sample)),
-        "median_error_pixels": float(np.median(errors_per_sample)),
-    }
+    def make_loader(
+        self,
+        indices: Sequence[int],
+        labels: Optional[np.ndarray] = None,
+        shuffle: bool = False,
+        batch_size: Optional[int] = None,
+    ) -> DataLoader:
+        dataset = MMFDataset(
+            self.speckles,
+            indices,
+            labels=labels,
+            speckle_dim=self.speckle_dim,
+            normalize=self.cfg.normalize_speckles,
+        )
+        loader_kwargs = dict(
+            dataset=dataset,
+            batch_size=int(batch_size or self.cfg.batch_size),
+            shuffle=shuffle,
+            num_workers=int(self.cfg.num_workers),
+            pin_memory=bool(self.cfg.pin_memory and self.device.type == "cuda"),
+        )
+        if int(self.cfg.num_workers) > 0:
+            loader_kwargs["persistent_workers"] = bool(self.cfg.persistent_workers)
+            loader_kwargs["prefetch_factor"] = int(self.cfg.prefetch_factor)
+        return DataLoader(**loader_kwargs)
 
+    def new_model(self) -> nn.Module:
+        model = MMDNSubNetwork(
+            outsize=self.outsize,
+            speckle_dim=self.speckle_dim,
+            base_channels=self.cfg.base_channels,
+            dropout=self.cfg.dropout,
+        )
+        model = model.to(self.device)
+        if self.channels_last:
+            model = model.to(memory_format=torch.channels_last)
+        if bool(self.cfg.compile_model) and hasattr(torch, "compile"):
+            print("torch.compile enabled for a newly created subnetwork")
+            model = torch.compile(model)
+        return model
 
-def spatial_accuracy_map(y_true: np.ndarray, y_pred: np.ndarray) -> np.ndarray:
-    return np.mean(np.isclose(y_true, y_pred), axis=0)
+    def make_optimizer(self, model: nn.Module):
+        name = self.cfg.optimizer.lower()
+        if name == "adadelta":
+            return torch.optim.Adadelta(model.parameters(), lr=self.cfg.learning_rate, weight_decay=self.cfg.weight_decay)
+        if name == "adamw":
+            return torch.optim.AdamW(model.parameters(), lr=self.cfg.learning_rate, weight_decay=self.cfg.weight_decay)
+        if name == "adam":
+            return torch.optim.Adam(model.parameters(), lr=self.cfg.learning_rate, weight_decay=self.cfg.weight_decay)
+        raise ValueError(f"Unsupported optimizer: {self.cfg.optimizer}")
 
+    def print_model_summary(self):
+        print("=" * 100)
+        print("MODEL SUMMARY")
+        print(self.clf3)
+        print("parameters clf3:", sum(p.numel() for p in self.clf3.parameters()))
+        print("device:", self.device)
+        print("use_amp:", self.use_amp, "amp_dtype:", str(self.amp_dtype))
+        print("channels_last:", self.channels_last)
+        if self.device.type == "cuda":
+            print("gpu:", torch.cuda.get_device_name(0))
+            print("cuda version in torch:", torch.version.cuda)
+            print("gpu total memory GB:", round(torch.cuda.get_device_properties(0).total_memory / 1024**3, 2))
+        print("=" * 100)
 
-# ============================================================
-# 6. Training and memory buffers
-# ============================================================
+    def binarize(self, pred: np.ndarray) -> np.ndarray:
+        pred = np.clip(pred, 0.0, 1.0)
+        if int(self.cfg.graylevel) == 2:
+            return (pred >= 0.5).astype(np.uint8)
+        return ((0.5 + pred * (self.cfg.graylevel - 1)).astype(np.uint8) / (self.cfg.graylevel - 1)).astype(np.float16)
 
-class MemoryBuffer:
-    def __init__(self, limit: Optional[int] = None):
-        self.limit = limit
-        self.indices = np.empty((0,), dtype=np.int64)
-        self.labels = np.empty((0, 0), dtype=np.float32)
-        self.confidence = np.empty((0,), dtype=np.float32)
-        self.initialized = False
+    def confidence_level(self, pred: np.ndarray) -> float:
+        return float(np.mean(np.abs(pred - 0.5) * self.cfg.confidence_scale + self.cfg.confidence_bias))
 
-    def add(self, indices: Sequence[int], labels: np.ndarray, confidence: Optional[np.ndarray] = None) -> None:
-        indices = np.asarray(indices, dtype=np.int64)
-        labels = np.asarray(labels, dtype=np.float32)
-        if confidence is None:
-            confidence = np.ones(len(indices), dtype=np.float32)
-        confidence = np.asarray(confidence, dtype=np.float32)
-        if len(indices) == 0:
-            return
-        if not self.initialized:
-            self.indices = indices.copy()
-            self.labels = labels.copy()
-            self.confidence = confidence.copy()
-            self.initialized = True
-        else:
-            self.indices = np.concatenate([self.indices, indices])
-            self.labels = np.concatenate([self.labels, labels])
-            self.confidence = np.concatenate([self.confidence, confidence])
-        if self.limit is not None and len(self.indices) > int(self.limit):
-            keep = int(self.limit)
-            self.indices = self.indices[-keep:]
-            self.labels = self.labels[-keep:]
-            self.confidence = self.confidence[-keep:]
+    def confidence_weights(self, c1: float, c2: float, c3: float) -> np.ndarray:
+        denom = max(1e-6, 3.0 - c1 - c2 - c3)
+        gain = float(self.cfg.confidence_weight_gain)
+        logits = np.array(
+            [
+                gain * (2.0 - c2 - c3) / denom,
+                gain * (2.0 - c1 - c3) / denom,
+                gain * (2.0 - c1 - c2) / denom,
+            ],
+            dtype=np.float64,
+        )
+        logits = logits - np.max(logits)
+        weights = np.exp(logits)
+        return weights / np.sum(weights)
 
-    def latest(self, n: int) -> Tuple[np.ndarray, np.ndarray]:
-        n = min(int(n), len(self.indices))
-        return self.indices[-n:], self.labels[-n:]
+    def predict_prob(self, model: nn.Module, indices: Sequence[int], batch_size: Optional[int] = None) -> np.ndarray:
+        model.eval()
+        preds = []
+        loader = self.make_loader(indices, labels=None, shuffle=False, batch_size=batch_size or self.cfg.batch_size)
+        with torch.no_grad():
+            for x in loader:
+                x = move_x_to_device(x, self.device, self.channels_last)
+                with torch.cuda.amp.autocast(enabled=self.use_amp, dtype=self.amp_dtype):
+                    logits = model(x)
+                preds.append(torch.sigmoid(logits).detach().float().cpu().numpy())
+        return np.concatenate(preds, axis=0)
 
-    def sample(self, n: int, seed: int, prefer_high_conf: bool = True) -> Tuple[np.ndarray, np.ndarray]:
-        if len(self.indices) <= int(n):
-            return self.indices, self.labels
-        rng = np.random.default_rng(seed)
-        if prefer_high_conf:
-            # Sample from the most reliable 70% to reduce pseudo-label drift.
-            threshold = np.quantile(self.confidence, 0.30)
-            pool = np.flatnonzero(self.confidence >= threshold)
-            if len(pool) < int(n):
-                pool = np.arange(len(self.indices))
-            chosen = rng.choice(pool, size=int(n), replace=False)
-        else:
-            chosen = rng.choice(np.arange(len(self.indices)), size=int(n), replace=False)
-        chosen = np.sort(chosen)
-        return self.indices[chosen], self.labels[chosen]
+    @staticmethod
+    def evaluate_prediction(y_true: np.ndarray, y_pred_binary: np.ndarray) -> dict:
+        y_true = np.asarray(y_true)
+        y_pred_binary = np.asarray(y_pred_binary)
+        sample_accuracy = np.mean(y_true == y_pred_binary, axis=1) * 100.0
+        return {
+            "pixel_accuracy": float(np.mean(y_true == y_pred_binary) * 100.0),
+            "sample_accuracy_mean": float(np.mean(sample_accuracy)),
+            "sample_accuracy_std": float(np.std(sample_accuracy)),
+            "exact_match_percent": float(np.mean(np.all(y_true == y_pred_binary, axis=1)) * 100.0),
+            "mae": float(np.mean(np.abs(y_true.astype(np.float32) - y_pred_binary.astype(np.float32)))),
+        }
 
-    def __len__(self) -> int:
-        return len(self.indices)
+    def ensemble_predict(self, indices: Sequence[int]):
+        p1 = self.predict_prob(self.clf1, indices)
+        p2 = self.predict_prob(self.clf2, indices)
+        p3 = self.predict_prob(self.clf3, indices)
+        c1, c2, c3 = self.confidence_level(p1), self.confidence_level(p2), self.confidence_level(p3)
+        weights = self.confidence_weights(c1, c2, c3)
+        prob = weights[0] * p1 + weights[1] * p2 + weights[2] * p3
+        pred = self.binarize(prob)
+        return pred, prob, (p1, p2, p3), (c1, c2, c3), weights
 
-
-def run_validation_loss(
-    model: nn.Module,
-    loader: DataLoader,
-    criterion: nn.Module,
-    device: torch.device,
-) -> float:
-    model.eval()
-    total_loss = 0.0
-    total_count = 0
-    with torch.no_grad():
-        for x, y in loader:
-            x = x.to(device, non_blocking=True)
-            y = y.to(device, non_blocking=True)
-            loss = criterion(model(x), y)
-            total_loss += float(loss.item()) * x.size(0)
-            total_count += x.size(0)
-    return total_loss / max(1, total_count)
-
-
-def fit_model(
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    speckles: np.ndarray,
-    train_indices: Sequence[int],
-    train_labels: np.ndarray,
-    speckle_dim: int,
-    cfg: Config,
-    device: torch.device,
-    epochs: int,
-    name: str,
-    output_dir: Path,
-    val_indices: Optional[Sequence[int]] = None,
-    val_labels: Optional[np.ndarray] = None,
-) -> List[Dict[str, float]]:
-    train_indices = np.asarray(train_indices, dtype=np.int64)
-    train_labels = np.asarray(train_labels, dtype=np.float32)
-    if len(train_indices) == 0:
-        raise ValueError(f"{name}: empty training set")
-
-    train_loader = make_loader(speckles, train_indices, train_labels, speckle_dim, cfg, shuffle=True)
-    val_loader = None
-    if val_indices is not None and val_labels is not None and len(val_indices) > 0:
-        val_loader = make_loader(speckles, val_indices, val_labels, speckle_dim, cfg, shuffle=False)
-
-    criterion = nn.BCEWithLogitsLoss()
-    best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-    best_optimizer_state = copy.deepcopy(optimizer.state_dict())
-    best_metric = float("inf")
-    wait = 0
-    history: List[Dict[str, float]] = []
-
-    for epoch in range(1, int(epochs) + 1):
-        model.train()
+    def run_validation_loss(self, model: nn.Module, val_loader: DataLoader, criterion) -> float:
+        model.eval()
         total_loss = 0.0
         total_count = 0
-        for x, y in train_loader:
-            x = x.to(device, non_blocking=True)
-            y = y.to(device, non_blocking=True)
-            optimizer.zero_grad(set_to_none=True)
-            logits = model(x)
-            loss = criterion(logits, y)
-            loss.backward()
-            if cfg.grad_clip_norm is not None and cfg.grad_clip_norm > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(cfg.grad_clip_norm))
-            optimizer.step()
-            total_loss += float(loss.item()) * x.size(0)
-            total_count += x.size(0)
+        with torch.no_grad():
+            for x, y in val_loader:
+                x = move_x_to_device(x, self.device, self.channels_last)
+                y = y.to(self.device, non_blocking=True)
+                with torch.cuda.amp.autocast(enabled=self.use_amp, dtype=self.amp_dtype):
+                    logits = model(x)
+                    loss = criterion(logits, y)
+                total_loss += float(loss.item()) * x.size(0)
+                total_count += x.size(0)
+        return total_loss / max(1, total_count)
 
-        train_loss = total_loss / max(1, total_count)
-        val_loss = np.nan
-        monitor = train_loss
-        if val_loader is not None:
-            val_loss = run_validation_loss(model, val_loader, criterion, device)
-            monitor = val_loss
+    def fit_on_memory(
+        self,
+        model: nn.Module,
+        optimizer,
+        train_indices: Sequence[int],
+        train_labels: np.ndarray,
+        val_indices: Optional[Sequence[int]] = None,
+        val_labels: Optional[np.ndarray] = None,
+        epochs: int = 1,
+        name: str = "train",
+    ) -> List[dict]:
+        train_indices = np.asarray(train_indices, dtype=np.int64)
+        train_labels = np.asarray(train_labels, dtype=np.float32)
+        if len(train_indices) == 0:
+            print(f"{name}: skipped because train_indices is empty")
+            return []
 
-        history.append({"epoch": epoch, "train_loss": float(train_loss), "val_loss": float(val_loss)})
-        print(f"{name} epoch {epoch:03d}: train_loss={train_loss:.6f}, val_loss={val_loss:.6f}")
+        train_loader = self.make_loader(train_indices, labels=train_labels, shuffle=True)
+        val_loader = None
+        if val_indices is not None and val_labels is not None and len(val_indices) > 0:
+            val_loader = self.make_loader(val_indices, labels=np.asarray(val_labels, dtype=np.float32), shuffle=False)
 
-        if monitor < best_metric - 1e-6:
-            best_metric = monitor
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            best_optimizer_state = copy.deepcopy(optimizer.state_dict())
-            wait = 0
+        criterion = nn.BCEWithLogitsLoss()
+        best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+        best_optimizer_state = copy.deepcopy(optimizer.state_dict())
+        best_metric = float("inf")
+        wait = 0
+        history: List[dict] = []
+
+        t0 = time.time()
+        for epoch in range(1, int(epochs) + 1):
+            model.train()
+            total_loss = 0.0
+            total_count = 0
+            for x, y in train_loader:
+                x = move_x_to_device(x, self.device, self.channels_last)
+                y = y.to(self.device, non_blocking=True)
+                optimizer.zero_grad(set_to_none=True)
+                with torch.cuda.amp.autocast(enabled=self.use_amp, dtype=self.amp_dtype):
+                    logits = model(x)
+                    loss = criterion(logits, y)
+                if self.use_amp:
+                    self.scaler.scale(loss).backward()
+                    self.scaler.step(optimizer)
+                    self.scaler.update()
+                else:
+                    loss.backward()
+                    optimizer.step()
+                total_loss += float(loss.detach().item()) * x.size(0)
+                total_count += x.size(0)
+
+            train_loss = total_loss / max(1, total_count)
+            if val_loader is not None:
+                val_loss = self.run_validation_loss(model, val_loader, criterion)
+                monitor = val_loss
+            else:
+                val_loss = np.nan
+                monitor = train_loss
+
+            row = {
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "train_samples": int(len(train_indices)),
+                "val_samples": 0 if val_indices is None else int(len(val_indices)),
+                "elapsed_sec": float(time.time() - t0),
+            }
+            history.append(row)
+            print(
+                f"{name} epoch {epoch:03d}: "
+                f"train_loss={train_loss:.6f}, val_loss={val_loss:.6f}, "
+                f"train_samples={len(train_indices)}, "
+                f"val_samples={0 if val_indices is None else len(val_indices)}"
+            )
+
+            if monitor < best_metric - 5e-6:
+                best_metric = monitor
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                best_optimizer_state = copy.deepcopy(optimizer.state_dict())
+                wait = 0
+            else:
+                wait += 1
+                if wait >= int(self.cfg.early_stop_patience):
+                    print(f"{name}: early stopping at epoch {epoch}")
+                    break
+
+        model.load_state_dict({k: v.to(self.device) for k, v in best_state.items()})
+        optimizer.load_state_dict(best_optimizer_state)
+        pd.DataFrame(history).to_csv(self.output_dir / "training_logs" / f"{name}.csv", index=False)
+        return history
+
+    def split_pretrain_indices(self, pretrain_indices: np.ndarray) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+        if self.cfg.pretrain_val_mode != "holdout" or self.cfg.pretrain_val_ratio <= 0:
+            return pretrain_indices, None
+        n_total = len(pretrain_indices)
+        n_val = int(round(n_total * float(self.cfg.pretrain_val_ratio)))
+        n_val = max(1, min(n_total - 1, n_val))
+        train_indices = pretrain_indices[:-n_val]
+        val_indices = pretrain_indices[-n_val:]
+        return train_indices, val_indices
+
+    def get_pretrain_validation(
+        self,
+        fixed_val_indices: Optional[np.ndarray],
+        first_dynamic_indices: np.ndarray,
+    ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], str]:
+        mode = self.cfg.pretrain_val_mode
+        if mode == "holdout":
+            if fixed_val_indices is None:
+                return None, None, "none"
+            return fixed_val_indices, self.labels_for_indices(fixed_val_indices), "fixed_holdout"
+        if mode == "first_dynamic":
+            return first_dynamic_indices, self.labels_for_indices(first_dynamic_indices), "first_dynamic_legacy"
+        if mode == "none":
+            return None, None, "none"
+        raise ValueError(f"Unsupported pretrain_val_mode: {mode}")
+
+    def split_dynamic_indices(self, indices: np.ndarray) -> List[np.ndarray]:
+        chunk_size = int(self.cfg.chunk_size)
+        if chunk_size <= 0 or len(indices) <= chunk_size:
+            return [indices]
+        return [indices[i : i + chunk_size] for i in range(0, len(indices), chunk_size)]
+
+    def select_pseudo_labels(
+        self,
+        indices: np.ndarray,
+        pred_binary: np.ndarray,
+        prob: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, dict]:
+        indices = np.asarray(indices, dtype=np.int64)
+        pred_binary = np.asarray(pred_binary)
+        prob = np.asarray(prob)
+
+        confidence_score = np.mean(np.abs(prob - 0.5) * 2.0, axis=1)
+        threshold = float(self.cfg.pseudo_sample_threshold)
+        if threshold <= 0:
+            mask = np.ones(len(indices), dtype=bool)
         else:
-            wait += 1
-            if wait >= int(cfg.early_stop_patience):
-                print(f"{name}: early stopping at epoch {epoch}")
-                break
+            mask = confidence_score >= threshold
 
-    model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
-    optimizer.load_state_dict(best_optimizer_state)
-    pd.DataFrame(history).to_csv(output_dir / f"{name}.csv", index=False)
-    return history
+        min_keep = int(math.ceil(float(self.cfg.min_pseudo_keep_ratio) * len(indices)))
+        if min_keep > 0 and np.sum(mask) < min_keep:
+            order = np.argsort(-confidence_score)
+            mask = np.zeros(len(indices), dtype=bool)
+            mask[order[:min_keep]] = True
 
+        kept_indices = indices[mask]
+        kept_labels = pred_binary[mask].astype(np.uint8)
+        stats = {
+            "pseudo_keep_count": int(np.sum(mask)),
+            "pseudo_keep_fraction": float(np.mean(mask)) if len(mask) else 0.0,
+            "pseudo_conf_mean": float(np.mean(confidence_score)) if len(confidence_score) else np.nan,
+            "pseudo_conf_min": float(np.min(confidence_score)) if len(confidence_score) else np.nan,
+            "pseudo_conf_max": float(np.max(confidence_score)) if len(confidence_score) else np.nan,
+        }
+        return kept_indices, kept_labels, stats
 
-def select_pseudo_labels(
-    indices: np.ndarray,
-    hard_labels: np.ndarray,
-    soft_probs: np.ndarray,
-    cfg: Config,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, float]]:
-    conf = confidence_per_sample(soft_probs)
-    keep_mask = conf >= float(cfg.pseudo_conf_threshold)
-    min_keep = max(1, int(round(len(indices) * float(cfg.min_pseudo_keep_fraction))))
-    if int(np.sum(keep_mask)) < min_keep:
-        order = np.argsort(conf)[::-1]
-        keep_mask = np.zeros_like(conf, dtype=bool)
-        keep_mask[order[:min_keep]] = True
-    selected_indices = np.asarray(indices)[keep_mask]
-    selected_conf = conf[keep_mask]
-    selected_labels = soft_probs[keep_mask] if cfg.use_soft_pseudo_labels else hard_labels[keep_mask]
-    info = {
-        "pseudo_keep_count": int(len(selected_indices)),
-        "pseudo_keep_fraction": float(len(selected_indices) / max(1, len(indices))),
-        "pseudo_conf_mean_all": float(np.mean(conf)),
-        "pseudo_conf_mean_kept": float(np.mean(selected_conf)) if len(selected_conf) else float("nan"),
-        "pseudo_conf_min_kept": float(np.min(selected_conf)) if len(selected_conf) else float("nan"),
-    }
-    return selected_indices, np.asarray(selected_labels, dtype=np.float32), selected_conf, info
+    def get_kappa_value(self, state: int, current_indices: np.ndarray) -> Optional[float]:
+        if self.kappa_by_time is not None and state < len(self.kappa_by_time):
+            return float(np.asarray(self.kappa_by_time).reshape(-1)[state])
+        if self.kappa_per_sample is not None:
+            return float(np.mean(np.asarray(self.kappa_per_sample)[current_indices]))
+        return None
+
+    def pretrain(self) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray]:
+        pretrain_indices_all = self.indices_for_segment(self.segments[0])
+        first_dynamic_indices = self.indices_for_segment(self.segments[1])
+        pretrain_train_indices, fixed_val_indices = self.split_pretrain_indices(pretrain_indices_all)
+        pretrain_train_labels = self.labels_for_indices(pretrain_train_indices)
+        val_indices, val_labels, val_name = self.get_pretrain_validation(fixed_val_indices, first_dynamic_indices)
+
+        print("=" * 100)
+        print("PRETRAINING SETUP")
+        print("pretrain_val_mode:", self.cfg.pretrain_val_mode)
+        print("validation source:", val_name)
+        print("pretrain total fixed-state samples:", len(pretrain_indices_all))
+        print("pretrain train samples:", len(pretrain_train_indices))
+        print("pretrain validation samples:", 0 if val_indices is None else len(val_indices))
+        print("dynamic states:", len(self.segments) - 1)
+        print("samples per first dynamic state:", int(self.segments[1]["count"]))
+        print("=" * 100)
+
+        t0 = time.time()
+        print("Pretraining L3/clf3 on fixed-state memory")
+        self.fit_on_memory(
+            self.clf3,
+            self.optimizers["clf3"],
+            pretrain_train_indices,
+            pretrain_train_labels,
+            val_indices,
+            val_labels,
+            self.cfg.pretrain_epochs,
+            "pretrain_clf3_L3_long_memory",
+        )
+
+        print("Pretraining S2/clf2 on last 3/4 of fixed-state memory")
+        n2 = max(1, int(len(pretrain_train_indices) * 3 / 4))
+        self.fit_on_memory(
+            self.clf2,
+            self.optimizers["clf2"],
+            pretrain_train_indices[-n2:],
+            pretrain_train_labels[-n2:],
+            val_indices,
+            val_labels,
+            self.cfg.pretrain_epochs,
+            "pretrain_clf2_S2_short_memory",
+        )
+
+        print("Pretraining S1/clf1 on last 2/3 of fixed-state memory")
+        n1 = max(1, int(len(pretrain_train_indices) * 2 / 3))
+        self.fit_on_memory(
+            self.clf1,
+            self.optimizers["clf1"],
+            pretrain_train_indices[-n1:],
+            pretrain_train_labels[-n1:],
+            val_indices,
+            val_labels,
+            self.cfg.pretrain_epochs,
+            "pretrain_clf1_S1_short_memory",
+        )
+
+        self.static_clf3 = self.new_model()
+        self.static_clf3.load_state_dict({k: v.detach().clone() for k, v in self.clf3.state_dict().items()})
+
+        if self.cfg.save_models:
+            torch.save(self.clf1.state_dict(), self.output_dir / "models" / "pretrain_clf1_S1.pt")
+            torch.save(self.clf2.state_dict(), self.output_dir / "models" / "pretrain_clf2_S2.pt")
+            torch.save(self.clf3.state_dict(), self.output_dir / "models" / "pretrain_clf3_L3.pt")
+            torch.save(self.static_clf3.state_dict(), self.output_dir / "models" / "static_clf3_L3.pt")
+
+        print(f"pretraining finished in {(time.time() - t0) / 60:.2f} min")
+
+        if self.cfg.fixed_eval_mode == "holdout" and fixed_val_indices is not None:
+            fixed_eval_indices = fixed_val_indices[-min(int(self.cfg.fixed_eval_count), len(fixed_val_indices)) :]
+            fixed_eval_source = "fixed_holdout"
+        else:
+            fixed_eval_indices = pretrain_indices_all[-min(int(self.cfg.fixed_eval_count), len(pretrain_indices_all)) :]
+            fixed_eval_source = "train_tail_or_all_fixed"
+
+        fixed_metrics_df = self.evaluate_fixed_state(fixed_eval_indices, fixed_eval_source)
+        return fixed_metrics_df, pretrain_train_indices, pretrain_train_labels
+
+    def evaluate_fixed_state(self, fixed_eval_indices: np.ndarray, source_name: str) -> pd.DataFrame:
+        if self.static_clf3 is None:
+            raise RuntimeError("static_clf3 is not initialized")
+
+        fixed_true_labels = self.labels_for_indices(fixed_eval_indices)
+        fixed_pred_ensemble, _, fixed_indiv_probs, fixed_confs, fixed_weights = self.ensemble_predict(fixed_eval_indices)
+        fixed_pred1 = self.binarize(fixed_indiv_probs[0])
+        fixed_pred2 = self.binarize(fixed_indiv_probs[1])
+        fixed_pred3 = self.binarize(fixed_indiv_probs[2])
+        fixed_static = self.binarize(self.predict_prob(self.static_clf3, fixed_eval_indices))
+
+        ens = self.evaluate_prediction(fixed_true_labels, fixed_pred_ensemble)
+        m1 = self.evaluate_prediction(fixed_true_labels, fixed_pred1)
+        m2 = self.evaluate_prediction(fixed_true_labels, fixed_pred2)
+        m3 = self.evaluate_prediction(fixed_true_labels, fixed_pred3)
+        st = self.evaluate_prediction(fixed_true_labels, fixed_static)
+
+        fixed_row = {
+            "state": int(self.segments[0]["state"]),
+            "eval_source": source_name,
+            "samples_evaluated": int(len(fixed_eval_indices)),
+            "ensemble_pixel_acc": ens["pixel_accuracy"],
+            "s1_pixel_acc": m1["pixel_accuracy"],
+            "s2_pixel_acc": m2["pixel_accuracy"],
+            "l3_pixel_acc": m3["pixel_accuracy"],
+            "static_l3_pixel_acc": st["pixel_accuracy"],
+            "ensemble_exact_match": ens["exact_match_percent"],
+            "ensemble_mae": ens["mae"],
+            "conf_s1": fixed_confs[0],
+            "conf_s2": fixed_confs[1],
+            "conf_l3": fixed_confs[2],
+            "weight_s1": float(fixed_weights[0]),
+            "weight_s2": float(fixed_weights[1]),
+            "weight_l3": float(fixed_weights[2]),
+        }
+        df = pd.DataFrame([fixed_row])
+        df.to_csv(self.output_dir / "fixed_state_pretrain_metrics.csv", index=False)
+        print("=" * 100)
+        print("FIXED-STATE VALIDATION METRICS")
+        print(df.to_string(index=False))
+        print(f"fixed-state ensemble accuracy: {fixed_row['ensemble_pixel_acc']:.4f}%")
+        print(f"fixed-state exact match: {fixed_row['ensemble_exact_match']:.4f}%")
+        print(f"fixed-state MAE: {fixed_row['ensemble_mae']:.6f}")
+        print("=" * 100)
+        return df
+
+    def run_dynamic_tracking(
+        self,
+        memory_indices: np.ndarray,
+        memory_labels: np.ndarray,
+    ) -> pd.DataFrame:
+        if self.static_clf3 is None:
+            raise RuntimeError("static_clf3 is not initialized")
+
+        rows: List[dict] = []
+        global_update = 0
+        memory_indices = np.asarray(memory_indices, dtype=np.int64)
+        memory_labels = np.asarray(memory_labels, dtype=np.uint8)
+        memory_limit = int(self.cfg.memory_limit or len(memory_indices))
+
+        last_example_payload = None
+
+        print("=" * 100)
+        print("DYNAMIC SELF-SUPERVISED TRACKING")
+        print("memory_limit:", memory_limit)
+        print("chunk_size:", self.cfg.chunk_size)
+        print("update_train_window:", self.cfg.update_train_window)
+        print("pseudo_sample_threshold:", self.cfg.pseudo_sample_threshold)
+        print("min_pseudo_keep_ratio:", self.cfg.min_pseudo_keep_ratio)
+        print("=" * 100)
+
+        for state_step, seg in enumerate(self.segments[1:], start=1):
+            state = int(seg["state"])
+            state_indices = self.indices_for_segment(seg)
+            state_chunks = self.split_dynamic_indices(state_indices)
+            print("=" * 100)
+            print(
+                f"dynamic state {state_step}/{len(self.segments) - 1}, "
+                f"state={state}, samples={len(state_indices)}, chunks={len(state_chunks)}, "
+                f"kappa={self.get_kappa_value(state, state_indices)}"
+            )
+
+            for chunk_id, current_indices in enumerate(state_chunks, start=1):
+                global_update += 1
+                current_indices = np.asarray(current_indices, dtype=np.int64)
+                true_labels = self.labels_for_indices(current_indices)
+                print("-" * 100)
+                print(
+                    f"online_update={global_update}, state={state}, "
+                    f"chunk={chunk_id}/{len(state_chunks)}, eval_samples={len(current_indices)}"
+                )
+
+                if global_update > 1:
+                    train_window = int(self.cfg.update_train_window or self.cfg.chunk_size or int(seg["count"]))
+                    train_n = min(train_window, len(memory_indices))
+                    train_indices = memory_indices[-train_n:]
+                    train_labels = memory_labels[-train_n:]
+                    dyn_val_indices = current_indices if self.cfg.use_true_labels_for_dynamic_early_stopping else None
+                    dyn_val_labels = true_labels if self.cfg.use_true_labels_for_dynamic_early_stopping else None
+
+                    # Stage3_v1-style alternating rebuild at state boundaries.
+                    if chunk_id == 1 and self.cfg.rebuild_interval > 0:
+                        if state_step % (2 * self.cfg.rebuild_interval) == self.cfg.rebuild_interval + 1:
+                            print("Rebuilding S1/clf1 from recent pseudo-labeled memory")
+                            self.clf1 = self.new_model()
+                            self.optimizers["clf1"] = self.make_optimizer(self.clf1)
+                            rebuild_n = min(len(memory_indices), max(train_n, int(memory_limit * 2 / 3)))
+                            self.fit_on_memory(
+                                self.clf1,
+                                self.optimizers["clf1"],
+                                memory_indices[-rebuild_n:],
+                                memory_labels[-rebuild_n:],
+                                dyn_val_indices,
+                                dyn_val_labels,
+                                self.cfg.update_epochs,
+                                f"rebuild_state{state:02d}_chunk{chunk_id:02d}_clf1_S1",
+                            )
+
+                        if state_step % (2 * self.cfg.rebuild_interval) == 1 and state_step > 1:
+                            print("Rebuilding S2/clf2 from recent pseudo-labeled memory")
+                            self.clf2 = self.new_model()
+                            self.optimizers["clf2"] = self.make_optimizer(self.clf2)
+                            rebuild_n = min(len(memory_indices), max(train_n, int(memory_limit * 3 / 4)))
+                            self.fit_on_memory(
+                                self.clf2,
+                                self.optimizers["clf2"],
+                                memory_indices[-rebuild_n:],
+                                memory_labels[-rebuild_n:],
+                                dyn_val_indices,
+                                dyn_val_labels,
+                                self.cfg.update_epochs,
+                                f"rebuild_state{state:02d}_chunk{chunk_id:02d}_clf2_S2",
+                            )
+
+                    print("Fine-tuning L3/clf3 on latest pseudo-labeled interval")
+                    self.fit_on_memory(
+                        self.clf3,
+                        self.optimizers["clf3"],
+                        train_indices,
+                        train_labels,
+                        dyn_val_indices,
+                        dyn_val_labels,
+                        self.cfg.update_epochs,
+                        f"update_{global_update:04d}_state{state:02d}_chunk{chunk_id:02d}_clf3_L3",
+                    )
+                    print("Fine-tuning S2/clf2 on latest pseudo-labeled interval")
+                    self.fit_on_memory(
+                        self.clf2,
+                        self.optimizers["clf2"],
+                        train_indices,
+                        train_labels,
+                        dyn_val_indices,
+                        dyn_val_labels,
+                        self.cfg.update_epochs,
+                        f"update_{global_update:04d}_state{state:02d}_chunk{chunk_id:02d}_clf2_S2",
+                    )
+                    print("Fine-tuning S1/clf1 on latest pseudo-labeled interval")
+                    self.fit_on_memory(
+                        self.clf1,
+                        self.optimizers["clf1"],
+                        train_indices,
+                        train_labels,
+                        dyn_val_indices,
+                        dyn_val_labels,
+                        self.cfg.update_epochs,
+                        f"update_{global_update:04d}_state{state:02d}_chunk{chunk_id:02d}_clf1_S1",
+                    )
+
+                pred_ensemble, prob_ensemble, indiv_probs, confs, weights = self.ensemble_predict(current_indices)
+                pred1 = self.binarize(indiv_probs[0])
+                pred2 = self.binarize(indiv_probs[1])
+                pred3 = self.binarize(indiv_probs[2])
+                pred_static = self.binarize(self.predict_prob(self.static_clf3, current_indices))
+
+                ens_metrics = self.evaluate_prediction(true_labels, pred_ensemble)
+                m1_metrics = self.evaluate_prediction(true_labels, pred1)
+                m2_metrics = self.evaluate_prediction(true_labels, pred2)
+                m3_metrics = self.evaluate_prediction(true_labels, pred3)
+                static_metrics = self.evaluate_prediction(true_labels, pred_static)
+
+                kept_indices, kept_labels, pseudo_stats = self.select_pseudo_labels(current_indices, pred_ensemble, prob_ensemble)
+                if len(kept_indices) == 0:
+                    print("Warning: pseudo-label filter kept zero samples. Falling back to keeping current chunk.")
+                    kept_indices = current_indices
+                    kept_labels = pred_ensemble.astype(np.uint8)
+                    pseudo_stats["pseudo_keep_count"] = int(len(current_indices))
+                    pseudo_stats["pseudo_keep_fraction"] = 1.0
+
+                kappa_value = self.get_kappa_value(state, current_indices)
+                row = {
+                    "online_update": global_update,
+                    "state_step": state_step,
+                    "state": state,
+                    "chunk": chunk_id,
+                    "chunks_in_state": len(state_chunks),
+                    "start": int(current_indices[0]),
+                    "stop": int(current_indices[-1]) + 1,
+                    "samples": int(len(current_indices)),
+                    "kappa": kappa_value,
+                    "ensemble_pixel_acc": ens_metrics["pixel_accuracy"],
+                    "s1_pixel_acc": m1_metrics["pixel_accuracy"],
+                    "s2_pixel_acc": m2_metrics["pixel_accuracy"],
+                    "l3_pixel_acc": m3_metrics["pixel_accuracy"],
+                    "static_l3_pixel_acc": static_metrics["pixel_accuracy"],
+                    "ensemble_exact_match": ens_metrics["exact_match_percent"],
+                    "s1_exact_match": m1_metrics["exact_match_percent"],
+                    "s2_exact_match": m2_metrics["exact_match_percent"],
+                    "l3_exact_match": m3_metrics["exact_match_percent"],
+                    "static_exact_match": static_metrics["exact_match_percent"],
+                    "ensemble_mae": ens_metrics["mae"],
+                    "static_mae": static_metrics["mae"],
+                    "conf_s1": confs[0],
+                    "conf_s2": confs[1],
+                    "conf_l3": confs[2],
+                    "weight_s1": float(weights[0]),
+                    "weight_s2": float(weights[1]),
+                    "weight_l3": float(weights[2]),
+                }
+                row.update(pseudo_stats)
+                rows.append(row)
+
+                if self.cfg.save_pseudo_labels:
+                    np.save(
+                        self.output_dir / "pseudo_labels" / f"pseudo_state_{state:02d}_chunk_{chunk_id:02d}.npy",
+                        pred_ensemble.astype(np.uint8),
+                    )
+
+                memory_indices = np.concatenate([memory_indices, kept_indices])[-memory_limit:]
+                memory_labels = np.concatenate([memory_labels, kept_labels])[-memory_limit:]
+
+                metrics_df = pd.DataFrame(rows)
+                metrics_df.to_csv(self.output_dir / "dynamic_tracking_metrics.csv", index=False)
+                print("current metrics:")
+                print(pd.DataFrame([row]).to_string(index=False))
+                print(
+                    f"ensemble={row['ensemble_pixel_acc']:.4f}%, "
+                    f"static={row['static_l3_pixel_acc']:.4f}%, "
+                    f"gain={row['ensemble_pixel_acc'] - row['static_l3_pixel_acc']:.4f} pp, "
+                    f"kept_pseudo={row['pseudo_keep_fraction']:.3f}"
+                )
+
+                last_example_payload = {
+                    "indices": current_indices.copy(),
+                    "true": true_labels.copy(),
+                    "ensemble": pred_ensemble.copy(),
+                    "static": pred_static.copy(),
+                    "state": state,
+                    "kappa": kappa_value,
+                }
+
+        metrics_df = pd.DataFrame(rows)
+        metrics_df.to_csv(self.output_dir / "dynamic_tracking_metrics.csv", index=False)
+        try:
+            metrics_df.to_excel(self.output_dir / "dynamic_tracking_metrics.xlsx", index=False)
+        except Exception as exc:
+            print(f"Warning: failed to save Excel file. Install openpyxl if needed. Error: {exc}")
+
+        if self.cfg.save_models:
+            torch.save(self.clf1.state_dict(), self.output_dir / "models" / "final_clf1_S1.pt")
+            torch.save(self.clf2.state_dict(), self.output_dir / "models" / "final_clf2_S2.pt")
+            torch.save(self.clf3.state_dict(), self.output_dir / "models" / "final_clf3_L3.pt")
+
+        print("=" * 100)
+        print("DYNAMIC TRACKING FINISHED")
+        print(metrics_df.to_string(index=False))
+        print("=" * 100)
+
+        if self.cfg.save_example_images and last_example_payload is not None:
+            self.save_recovery_examples(last_example_payload)
+
+        return metrics_df
+
+    def save_recovery_examples(self, payload: dict):
+        if self.pattern_side * self.pattern_side != self.outsize:
+            print("Skipping example image grid because output size is not square.")
+            return
+        n = min(int(self.cfg.example_count), len(payload["indices"]))
+        if n <= 0:
+            return
+        true = payload["true"][:n].reshape(n, self.pattern_side, self.pattern_side)
+        ensemble = payload["ensemble"][:n].reshape(n, self.pattern_side, self.pattern_side)
+        static = payload["static"][:n].reshape(n, self.pattern_side, self.pattern_side)
+
+        fig, axes = plt.subplots(3, n, figsize=(1.45 * n, 4.8))
+        if n == 1:
+            axes = np.asarray(axes).reshape(3, 1)
+        for j in range(n):
+            axes[0, j].imshow(true[j], cmap="gray", vmin=0, vmax=1)
+            axes[0, j].set_title(f"GT {j+1}", fontsize=8)
+            axes[1, j].imshow(static[j], cmap="gray", vmin=0, vmax=1)
+            axes[1, j].set_title("Static", fontsize=8)
+            axes[2, j].imshow(ensemble[j], cmap="gray", vmin=0, vmax=1)
+            axes[2, j].set_title("MMDN", fontsize=8)
+            for i in range(3):
+                axes[i, j].set_xticks([])
+                axes[i, j].set_yticks([])
+        fig.suptitle(f"Recovery examples at state={payload['state']}, kappa={payload['kappa']}")
+        fig.tight_layout()
+        path = self.output_dir / "recovery_examples_last_state.png"
+        fig.savefig(path, dpi=180)
+        fig.savefig(self.output_dir / "figures" / "recovery_examples_last_state.png", dpi=180)
+        plt.close(fig)
+        print("saved:", path)
+
+    def make_plots(self, fixed_metrics_df: pd.DataFrame, metrics_df: pd.DataFrame):
+        if metrics_df.empty:
+            print("No dynamic metrics to plot.")
+            return
+
+        metrics_path = self.output_dir / "dynamic_tracking_metrics.csv"
+        fixed_path = self.output_dir / "fixed_state_pretrain_metrics.csv"
+        print("=" * 100)
+        print("SAVING FIGURES")
+        print("metrics source:", metrics_path)
+        print("fixed metrics source:", fixed_path)
+
+        use_kappa = "kappa" in metrics_df.columns and metrics_df["kappa"].notna().all()
+        x_axis = metrics_df["kappa"].to_numpy() if use_kappa else metrics_df["online_update"].to_numpy()
+        x_label = "kappa" if use_kappa else "dynamic step"
+
+        # Same main accuracy figure as Stage3_v1.ipynb.
+        plt.figure(figsize=(9, 5))
+        plt.plot(x_axis, metrics_df["ensemble_pixel_acc"], marker="o", label="MMDN ensemble")
+        plt.plot(x_axis, metrics_df["s1_pixel_acc"], marker=".", label="S1 short memory", alpha=0.8)
+        plt.plot(x_axis, metrics_df["s2_pixel_acc"], marker=".", label="S2 short memory", alpha=0.8)
+        plt.plot(x_axis, metrics_df["l3_pixel_acc"], marker=".", label="L3 long memory", alpha=0.8)
+        plt.plot(x_axis, metrics_df["static_l3_pixel_acc"], marker="x", label="static pretrained L3", linestyle="--")
+        plt.xlabel(x_label)
+        plt.ylabel("pixel accuracy (%)")
+        plt.title("Dynamic tracking accuracy")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        p = self.output_dir / "accuracy_over_drift.png"
+        plt.savefig(p, dpi=180)
+        plt.savefig(self.output_dir / "figures" / "accuracy_over_drift.png", dpi=180)
+        plt.close()
+        print("saved:", p)
+
+        # Same ensemble-weight figure as Stage3_v1.ipynb.
+        plt.figure(figsize=(9, 4))
+        plt.stackplot(
+            metrics_df["online_update"],
+            metrics_df["weight_s1"],
+            metrics_df["weight_s2"],
+            metrics_df["weight_l3"],
+            labels=["S1", "S2", "L3"],
+            alpha=0.85,
+        )
+        plt.xlabel("online update")
+        plt.ylabel("ensemble weight")
+        plt.title("Confidence-based ensemble weights")
+        plt.ylim(0, 1)
+        plt.legend(loc="upper right")
+        plt.tight_layout()
+        p = self.output_dir / "ensemble_weights.png"
+        plt.savefig(p, dpi=180)
+        plt.savefig(self.output_dir / "figures" / "ensemble_weights.png", dpi=180)
+        plt.close()
+        print("saved:", p)
+
+        # State-averaged accuracy plot, useful when each kappa has multiple chunks.
+        group_cols = ["state", "kappa"] if use_kappa else ["state"]
+        state_mean = metrics_df.groupby(group_cols, as_index=False).agg(
+            ensemble_pixel_acc=("ensemble_pixel_acc", "mean"),
+            static_l3_pixel_acc=("static_l3_pixel_acc", "mean"),
+            s1_pixel_acc=("s1_pixel_acc", "mean"),
+            s2_pixel_acc=("s2_pixel_acc", "mean"),
+            l3_pixel_acc=("l3_pixel_acc", "mean"),
+            ensemble_exact_match=("ensemble_exact_match", "mean"),
+            ensemble_mae=("ensemble_mae", "mean"),
+        )
+        state_mean.to_csv(self.output_dir / "dynamic_tracking_state_mean.csv", index=False)
+        try:
+            state_mean.to_excel(self.output_dir / "dynamic_tracking_state_mean.xlsx", index=False)
+        except Exception as exc:
+            print(f"Warning: failed to save state-mean Excel file: {exc}")
+
+        x_state = state_mean["kappa"].to_numpy() if use_kappa else state_mean["state"].to_numpy()
+        plt.figure(figsize=(9, 5))
+        plt.plot(x_state, state_mean["static_l3_pixel_acc"], marker="x", linestyle="--", label="Static")
+        plt.plot(x_state, state_mean["ensemble_pixel_acc"], marker="o", label="MMDN")
+        plt.xlabel(x_label if use_kappa else "state")
+        plt.ylabel("pixel accuracy (%)")
+        plt.title("Dynamic tracking and input recovery accuracy")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        p = self.output_dir / "accuracy_state_average_static_vs_mmdn.png"
+        plt.savefig(p, dpi=180)
+        plt.savefig(self.output_dir / "figures" / "accuracy_state_average_static_vs_mmdn.png", dpi=180)
+        plt.close()
+        print("saved:", p)
+
+        # Exact-match plot.
+        plt.figure(figsize=(9, 4))
+        plt.plot(x_axis, metrics_df["ensemble_exact_match"], marker="o", label="MMDN ensemble")
+        if "static_exact_match" in metrics_df.columns:
+            plt.plot(x_axis, metrics_df["static_exact_match"], marker="x", linestyle="--", label="static pretrained L3")
+        plt.xlabel(x_label)
+        plt.ylabel("exact match (%)")
+        plt.title("Exact-match recovery accuracy")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        p = self.output_dir / "exact_match_over_drift.png"
+        plt.savefig(p, dpi=180)
+        plt.savefig(self.output_dir / "figures" / "exact_match_over_drift.png", dpi=180)
+        plt.close()
+        print("saved:", p)
+
+        # MAE plot.
+        plt.figure(figsize=(9, 4))
+        plt.plot(x_axis, metrics_df["ensemble_mae"], marker="o", label="MMDN ensemble")
+        if "static_mae" in metrics_df.columns:
+            plt.plot(x_axis, metrics_df["static_mae"], marker="x", linestyle="--", label="static pretrained L3")
+        plt.xlabel(x_label)
+        plt.ylabel("MAE")
+        plt.title("Recovery MAE over drift")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        p = self.output_dir / "mae_over_drift.png"
+        plt.savefig(p, dpi=180)
+        plt.savefig(self.output_dir / "figures" / "mae_over_drift.png", dpi=180)
+        plt.close()
+        print("saved:", p)
+
+        # Pseudo-label keep ratio plot.
+        if "pseudo_keep_fraction" in metrics_df.columns:
+            plt.figure(figsize=(9, 4))
+            plt.plot(metrics_df["online_update"], metrics_df["pseudo_keep_fraction"], marker="o")
+            plt.xlabel("online update")
+            plt.ylabel("kept pseudo-label fraction")
+            plt.title("Pseudo-label filtering ratio")
+            plt.ylim(0, 1.05)
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            p = self.output_dir / "pseudo_label_keep_fraction.png"
+            plt.savefig(p, dpi=180)
+            plt.savefig(self.output_dir / "figures" / "pseudo_label_keep_fraction.png", dpi=180)
+            plt.close()
+            print("saved:", p)
+
+        summary = {
+            "fixed": fixed_metrics_df.to_dict(orient="records"),
+            "dynamic_mean_ensemble_pixel_acc": float(metrics_df["ensemble_pixel_acc"].mean()),
+            "dynamic_mean_static_l3_pixel_acc": float(metrics_df["static_l3_pixel_acc"].mean()),
+            "dynamic_mean_gain_pp": float((metrics_df["ensemble_pixel_acc"] - metrics_df["static_l3_pixel_acc"]).mean()),
+            "dynamic_last_ensemble_pixel_acc": float(metrics_df["ensemble_pixel_acc"].iloc[-1]),
+            "dynamic_last_static_l3_pixel_acc": float(metrics_df["static_l3_pixel_acc"].iloc[-1]),
+            "dynamic_last_gain_pp": float(metrics_df["ensemble_pixel_acc"].iloc[-1] - metrics_df["static_l3_pixel_acc"].iloc[-1]),
+            "num_dynamic_rows": int(len(metrics_df)),
+        }
+        (self.output_dir / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+        print("saved:", self.output_dir / "summary.json")
+        print("summary:")
+        print(json.dumps(summary, indent=2, ensure_ascii=False))
+        print("=" * 100)
 
 
 # ============================================================
-# 7. Plotting
+# 7. Main entry
 # ============================================================
 
-def save_line_plots(metrics_df: pd.DataFrame, output_dir: Path) -> None:
-    x = metrics_df["kappa"] if "kappa" in metrics_df and metrics_df["kappa"].notna().all() else metrics_df["online_update"]
-    xlabel = "kappa" if "kappa" in metrics_df and metrics_df["kappa"].notna().all() else "online update"
 
-    plt.figure(figsize=(10, 5))
-    plt.plot(x, metrics_df["ensemble_pixel_acc"], marker="o", label="MMDN ensemble")
-    plt.plot(x, metrics_df["s1_pixel_acc"], marker=".", alpha=0.80, label="S1 short memory")
-    plt.plot(x, metrics_df["s2_pixel_acc"], marker=".", alpha=0.80, label="S2 short memory")
-    plt.plot(x, metrics_df["l3_pixel_acc"], marker=".", alpha=0.80, label="L3 long memory")
-    plt.plot(x, metrics_df["static_l3_pixel_acc"], marker="x", linestyle="--", label="StaticNN")
-    plt.xlabel(xlabel)
-    plt.ylabel("pixel accuracy (%)")
-    plt.title("Stage 3.1 dynamic tracking accuracy")
-    plt.grid(True, alpha=0.3)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(output_dir / "accuracy_over_drift.png", dpi=200)
-    plt.close()
-
-    plt.figure(figsize=(10, 4))
-    plt.plot(metrics_df["online_update"], metrics_df["ensemble_bit_error_rate"], marker="o", label="MMDN ensemble")
-    plt.plot(metrics_df["online_update"], metrics_df["static_bit_error_rate"], marker="x", linestyle="--", label="StaticNN")
-    plt.yscale("log")
-    plt.xlabel("online update")
-    plt.ylabel("bit error rate")
-    plt.title("Error-rate comparison")
-    plt.grid(True, which="both", alpha=0.3)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(output_dir / "bit_error_rate_log.png", dpi=200)
-    plt.close()
-
-    plt.figure(figsize=(10, 4))
-    plt.stackplot(
-        metrics_df["online_update"],
-        metrics_df["weight_s1"],
-        metrics_df["weight_s2"],
-        metrics_df["weight_l3"],
-        labels=["S1", "S2", "L3"],
-        alpha=0.85,
-    )
-    plt.xlabel("online update")
-    plt.ylabel("ensemble weight")
-    plt.title("Confidence-based ensemble weights")
-    plt.ylim(0, 1)
-    plt.legend(loc="upper right")
-    plt.tight_layout()
-    plt.savefig(output_dir / "ensemble_weights.png", dpi=200)
-    plt.close()
-
-    plt.figure(figsize=(10, 4))
-    plt.plot(metrics_df["online_update"], metrics_df["pseudo_keep_fraction"], marker="o")
-    plt.xlabel("online update")
-    plt.ylabel("kept pseudo-label fraction")
-    plt.title("Pseudo-label selection rate")
-    plt.ylim(0, 1.05)
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(output_dir / "pseudo_label_keep_fraction.png", dpi=200)
-    plt.close()
+def set_seed_and_backend(seed: int, cfg: Config):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = bool(cfg.cudnn_benchmark and not cfg.deterministic)
+    torch.backends.cudnn.deterministic = bool(cfg.deterministic)
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
 
 
-def save_spatial_map(acc_vec: np.ndarray, side: Optional[int], path: Path, title: str) -> None:
-    if side is None:
-        np.save(path.with_suffix(".npy"), acc_vec)
-        return
-    img = np.asarray(acc_vec).reshape(side, side)
-    plt.figure(figsize=(4.6, 4.2))
-    plt.imshow(img, vmin=0.0, vmax=1.0)
-    plt.colorbar(label="accuracy")
-    plt.title(title)
-    plt.axis("off")
-    plt.tight_layout()
-    plt.savefig(path, dpi=200)
-    plt.close()
-
-
-def save_examples(
-    y_true: np.ndarray,
-    y_ens: np.ndarray,
-    y_static: np.ndarray,
-    side: Optional[int],
-    path: Path,
-    title: str,
-    max_examples: int,
-) -> None:
-    if side is None:
-        return
-    n = min(max_examples, len(y_true))
-    if n <= 0:
-        return
-    # Prefer examples with errors, otherwise take the first examples.
-    err = np.sum(~np.isclose(y_true, y_ens), axis=1)
-    order = np.argsort(err)[::-1]
-    chosen = order[:n]
-
-    fig, axes = plt.subplots(n, 4, figsize=(8, 2.1 * n))
-    if n == 1:
-        axes = axes[None, :]
-    for row_i, idx in enumerate(chosen):
-        truth = y_true[idx].reshape(side, side)
-        ens = y_ens[idx].reshape(side, side)
-        sta = y_static[idx].reshape(side, side)
-        wrong = np.logical_xor(truth > 0.5, ens > 0.5).astype(float)
-        imgs = [truth, ens, sta, wrong]
-        names = ["truth", "ensemble", "static", "ensemble wrong"]
-        for col_i, (img, name) in enumerate(zip(imgs, names)):
-            axes[row_i, col_i].imshow(img, vmin=0, vmax=1)
-            axes[row_i, col_i].set_title(name)
-            axes[row_i, col_i].axis("off")
-    fig.suptitle(title)
-    plt.tight_layout()
-    plt.savefig(path, dpi=200)
-    plt.close()
-
-
-# ============================================================
-# 8. Main workflow
-# ============================================================
-
-def main(cfg: Config = CFG) -> None:
-    set_seed(cfg.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+def main():
+    cfg = parse_args()
     requested_data_dir = Path(cfg.data_dir).expanduser().resolve()
-    data_dir = resolve_dataset_dir(requested_data_dir)
-    output_dir = Path(cfg.output_dir).expanduser().resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "models").mkdir(exist_ok=True)
-    (output_dir / "pseudo_labels").mkdir(exist_ok=True)
-    (output_dir / "spatial_maps").mkdir(exist_ok=True)
-    (output_dir / "examples").mkdir(exist_ok=True)
+    output_dir = setup_output_and_logging(cfg, requested_data_dir)
+    set_seed_and_backend(cfg.seed, cfg)
 
+    print("=" * 100)
+    print("STAGE 3.1 MMDN TUNED FULL VERSION")
     print("requested_data_dir:", requested_data_dir)
-    print("actual_data_dir:", data_dir)
     print("output_dir:", output_dir)
     print("torch:", torch.__version__)
-    print("device:", device)
+    print("cuda available:", torch.cuda.is_available())
+    print("torch cuda version:", torch.version.cuda)
+    if torch.cuda.is_available():
+        print("cuda device count:", torch.cuda.device_count())
+        print("cuda device 0:", torch.cuda.get_device_name(0))
+        print("cuda total memory GB:", round(torch.cuda.get_device_properties(0).total_memory / 1024**3, 2))
+    print("configuration:")
+    print(json.dumps(asdict(cfg), indent=2, ensure_ascii=False))
+    print("=" * 100)
 
-    with open(output_dir / "config.json", "w", encoding="utf-8") as f:
-        json.dump(asdict(cfg), f, indent=2, ensure_ascii=False)
-
-    metadata_path = data_dir / "metadata.json"
-    metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.exists() else {}
-
-    arrays = load_arrays_from_npz(data_dir)
-    source_kind = "npz"
-    if not arrays:
-        arrays = load_arrays_from_npy(data_dir)
-        source_kind = "npy"
-    if not arrays:
-        raise FileNotFoundError(f"No readable .npz or .npy dataset arrays found in {data_dir}")
+    actual_data_dir, arrays, source_kind = find_dataset_dir(requested_data_dir, cfg.preferred_dataset_name)
+    metadata = load_metadata(actual_data_dir)
 
     speckles = pick_array(arrays, ["speckles", "speckle", "x", "inputs"])
-    patterns_raw = pick_array(arrays, ["pattern", "patterns", "y", "labels", "targets"])
+    patterns = pick_array(arrays, ["pattern", "patterns", "y", "labels", "targets"])
     time_index = pick_array(arrays, ["time_index", "time", "state_index", "state"], required=False)
     counts_by_time = pick_array(arrays, ["counts_by_time", "counts"], required=False)
     kappa_by_time = pick_array(arrays, ["kappa_by_time"], required=False)
     kappa_per_sample = pick_array(arrays, ["kappa_per_sample", "kappa"], required=False)
 
-    if speckles is None or patterns_raw is None:
-        raise RuntimeError("Required arrays were not loaded correctly.")
+    patterns = np.asarray(patterns, dtype=np.float32)
+    if patterns.ndim != 2:
+        raise ValueError(f"patterns must be a 2D array, got shape {patterns.shape}")
+    if speckles.ndim != 3:
+        raise ValueError(f"speckles must be a 3D array, got shape {speckles.shape}")
+    if len(speckles) != len(patterns):
+        raise ValueError(f"speckles length {len(speckles)} does not match patterns length {len(patterns)}")
 
-    targets = normalize_targets(patterns_raw, cfg.graylevel)
-    n_samples = int(targets.shape[0])
-    outsize = int(targets.shape[1])
-    side = infer_side_length(outsize)
-    speckle_dim = int(cfg.speckle_dim or metadata.get("mmdn_training_hint", {}).get("speckle_dim", speckles.shape[1]))
-
+    print("=" * 100)
+    print("DATASET SUMMARY")
     print("source_kind:", source_kind)
-    print("available arrays:", sorted(arrays.keys()))
+    print("actual_data_dir:", actual_data_dir)
+    print("available arrays:", sorted(arrays))
     print("speckles:", speckles.shape, speckles.dtype)
-    print("targets:", targets.shape, targets.dtype, "min/max", float(np.min(targets)), float(np.max(targets)))
-    print("speckle_dim:", speckle_dim, "outsize:", outsize, "pattern_side:", side)
+    print("targets:", patterns.shape, patterns.dtype, "min/max", float(np.min(patterns)), float(np.max(patterns)))
+    if time_index is not None:
+        ti = np.asarray(time_index)
+        print("time_index:", ti.shape, ti.dtype, int(np.min(ti)), int(np.max(ti)))
+    if counts_by_time is not None:
+        print("counts_by_time:", np.asarray(counts_by_time).astype(int).reshape(-1).tolist())
+    if kappa_by_time is not None:
+        print("kappa_by_time:", np.asarray(kappa_by_time).astype(float).reshape(-1).tolist())
+    if kappa_per_sample is not None:
+        print("kappa_per_sample:", np.asarray(kappa_per_sample).shape, np.asarray(kappa_per_sample).dtype)
+    print("=" * 100)
 
-    segments = infer_segments(n_samples, time_index, counts_by_time, metadata, cfg)
-    if len(segments) < 2:
-        raise ValueError("Need one fixed-state pretraining segment plus at least one dynamic segment.")
-
-    segment_df = pd.DataFrame(segments)
-    if kappa_by_time is not None and len(kappa_by_time) >= len(segment_df):
-        segment_df["kappa"] = np.asarray(kappa_by_time)[:len(segment_df)]
+    segments = infer_segments(patterns, time_index, counts_by_time, metadata, cfg)
+    segment_df = make_segment_dataframe(segments, kappa_by_time)
     segment_df.to_csv(output_dir / "segments.csv", index=False)
-    print(segment_df)
 
-    pretrain_all_indices = indices_for_segment(segments[0])
-    pretrain_train_idx, pretrain_val_idx = split_train_val(pretrain_all_indices, cfg.pretrain_val_fraction, cfg.seed)
-    pretrain_train_y = labels_for_indices(targets, pretrain_train_idx)
-    pretrain_val_y = labels_for_indices(targets, pretrain_val_idx)
-
-    print("pretrain train samples:", len(pretrain_train_idx))
-    print("pretrain val samples:", len(pretrain_val_idx))
-    print("dynamic states:", len(segments) - 1)
-
-    # Supervised base pretraining. This avoids dynamic-label leakage.
-    base = new_model(outsize, speckle_dim, cfg, device)
-    base_opt = make_optimizer(base, cfg)
-    t0 = time.time()
-    fit_model(
-        base,
-        base_opt,
-        speckles,
-        pretrain_train_idx,
-        pretrain_train_y,
-        speckle_dim,
-        cfg,
-        device,
-        cfg.pretrain_epochs,
-        "pretrain_base_no_future_leakage",
-        output_dir,
-        val_indices=pretrain_val_idx,
-        val_labels=pretrain_val_y,
+    speckle_dim = int(
+        cfg.speckle_dim
+        or metadata.get("mmdn_training_hint", {}).get("speckle_dim", speckles.shape[1])
     )
-    print(f"pretraining finished in {(time.time() - t0) / 60:.2f} min")
+    outsize = int(patterns.shape[1])
+    pattern_side = int(round(math.sqrt(outsize)))
 
-    models: Dict[str, nn.Module] = {
-        "s1": new_model(outsize, speckle_dim, cfg, device),
-        "s2": new_model(outsize, speckle_dim, cfg, device),
-        "l3": new_model(outsize, speckle_dim, cfg, device),
-        "static": new_model(outsize, speckle_dim, cfg, device),
-    }
-    for m in models.values():
-        m.load_state_dict(copy.deepcopy(base.state_dict()))
+    print("=" * 100)
+    print("SEGMENTS")
+    print(segment_df.to_string(index=False))
+    print("speckle_dim:", speckle_dim, "outsize:", outsize, "pattern_side:", pattern_side)
+    print("=" * 100)
 
-    optimizers = {
-        "s1": make_optimizer(models["s1"], cfg),
-        "s2": make_optimizer(models["s2"], cfg),
-        "l3": make_optimizer(models["l3"], cfg),
-    }
-
-    torch.save(base.state_dict(), output_dir / "models" / "pretrain_base.pt")
-    torch.save(models["static"].state_dict(), output_dir / "models" / "static_baseline.pt")
-
-    # Memory buffers.
-    dynamic_total = sum(int(seg["count"]) for seg in segments[1:])
-    long_limit = cfg.long_memory_limit or (len(pretrain_train_idx) + dynamic_total)
-    long_memory = MemoryBuffer(limit=int(long_limit))
-    short_memory = MemoryBuffer(limit=int(cfg.short_memory_chunks * (cfg.dynamic_chunk_size or segments[1]["count"])))
-
-    # L3 anchor keeps clean fixed-state labels and prevents pure pseudo-label collapse.
-    anchor_idx = safe_sample(pretrain_train_idx, int(cfg.anchor_samples_for_l3), cfg.seed + 100)
-    anchor_y = labels_for_indices(targets, anchor_idx)
-    long_memory.add(anchor_idx, anchor_y, confidence=np.ones(len(anchor_idx), dtype=np.float32))
-
-    # Fixed-state validation evaluation.
-    fixed_eval_idx = pretrain_val_idx
-    fixed_true = labels_for_indices(targets, fixed_eval_idx)
-    fixed_ens, fixed_prob, fixed_probs, fixed_conf, fixed_weights = ensemble_predict(
-        models, speckles, fixed_eval_idx, speckle_dim, cfg, device
+    exp = Experiment(
+        cfg=cfg,
+        output_dir=output_dir,
+        speckles=speckles,
+        patterns=patterns,
+        segments=segments,
+        kappa_by_time=kappa_by_time,
+        kappa_per_sample=kappa_per_sample,
+        speckle_dim=speckle_dim,
     )
-    fixed_static = binarize_prob(predict_prob(models["static"], speckles, fixed_eval_idx, speckle_dim, cfg, device), cfg.graylevel)
-    fixed_metrics = evaluate_prediction(fixed_true, fixed_ens)
-    fixed_row = {
-        "state": int(segments[0]["state"]),
-        "samples_evaluated": int(len(fixed_eval_idx)),
-        "ensemble_pixel_acc": fixed_metrics["pixel_accuracy"],
-        "ensemble_exact_match": fixed_metrics["exact_match_percent"],
-        "ensemble_mae": fixed_metrics["mae"],
-        "static_l3_pixel_acc": evaluate_prediction(fixed_true, fixed_static)["pixel_accuracy"],
-        "conf_s1": fixed_conf["s1"],
-        "conf_s2": fixed_conf["s2"],
-        "conf_l3": fixed_conf["l3"],
-        "weight_s1": fixed_weights["s1"],
-        "weight_s2": fixed_weights["s2"],
-        "weight_l3": fixed_weights["l3"],
-    }
-    pd.DataFrame([fixed_row]).to_csv(output_dir / "fixed_state_validation_metrics.csv", index=False)
-    print("fixed-state validation metrics:")
-    print(pd.DataFrame([fixed_row]))
+    exp.print_model_summary()
 
-    rows: List[Dict[str, float]] = []
-    saved_examples: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
-    global_update = 0
-    rebuild_toggle = 0
+    t_start = time.time()
+    fixed_metrics_df, memory_indices, memory_labels = exp.pretrain()
+    metrics_df = exp.run_dynamic_tracking(memory_indices, memory_labels)
+    exp.make_plots(fixed_metrics_df, metrics_df)
+    elapsed = (time.time() - t_start) / 60.0
 
-    # Dynamic loop: predict current unlabeled batch, evaluate only for analysis,
-    # then update models using pseudo-labels from this current batch for future batches.
-    for state_step, seg in enumerate(segments[1:], start=1):
-        state = int(seg["state"])
-        state_indices = indices_for_segment(seg)
-        chunks = split_dynamic_indices(state_indices, cfg.dynamic_chunk_size)
-        print("=" * 90)
-        print(f"dynamic state {state_step}/{len(segments)-1}, state={state}, samples={len(state_indices)}, chunks={len(chunks)}")
-
-        for chunk_id, current_indices in enumerate(chunks, start=1):
-            global_update += 1
-            if cfg.max_eval_samples_per_chunk is not None and len(current_indices) > int(cfg.max_eval_samples_per_chunk):
-                eval_indices = safe_sample(current_indices, int(cfg.max_eval_samples_per_chunk), cfg.seed + global_update)
-            else:
-                eval_indices = current_indices
-            true_labels = labels_for_indices(targets, eval_indices)
-
-            print("-" * 90)
-            print(f"online_update={global_update}, state={state}, chunk={chunk_id}/{len(chunks)}, eval_samples={len(eval_indices)}")
-
-            ens_pred, ens_prob, probs, conf, weights = ensemble_predict(
-                models, speckles, eval_indices, speckle_dim, cfg, device
-            )
-            pred_s1 = binarize_prob(probs["s1"], cfg.graylevel)
-            pred_s2 = binarize_prob(probs["s2"], cfg.graylevel)
-            pred_l3 = binarize_prob(probs["l3"], cfg.graylevel)
-            pred_static = binarize_prob(
-                predict_prob(models["static"], speckles, eval_indices, speckle_dim, cfg, device),
-                cfg.graylevel,
-            )
-
-            ens_m = evaluate_prediction(true_labels, ens_pred)
-            s1_m = evaluate_prediction(true_labels, pred_s1)
-            s2_m = evaluate_prediction(true_labels, pred_s2)
-            l3_m = evaluate_prediction(true_labels, pred_l3)
-            static_m = evaluate_prediction(true_labels, pred_static)
-
-            kappa_value = np.nan
-            if kappa_by_time is not None and state < len(kappa_by_time):
-                kappa_value = float(np.asarray(kappa_by_time)[state])
-            elif kappa_per_sample is not None:
-                kappa_value = float(np.mean(np.asarray(kappa_per_sample)[eval_indices]))
-
-            row = {
-                "online_update": int(global_update),
-                "state_step": int(state_step),
-                "state": int(state),
-                "chunk": int(chunk_id),
-                "chunks_in_state": int(len(chunks)),
-                "start": int(eval_indices[0]),
-                "stop": int(eval_indices[-1]) + 1,
-                "samples": int(len(eval_indices)),
-                "kappa": kappa_value,
-                "ensemble_pixel_acc": ens_m["pixel_accuracy"],
-                "ensemble_bit_error_rate": ens_m["bit_error_rate"],
-                "ensemble_exact_match": ens_m["exact_match_percent"],
-                "ensemble_mae": ens_m["mae"],
-                "ensemble_mean_error_pixels": ens_m["mean_error_pixels"],
-                "s1_pixel_acc": s1_m["pixel_accuracy"],
-                "s2_pixel_acc": s2_m["pixel_accuracy"],
-                "l3_pixel_acc": l3_m["pixel_accuracy"],
-                "static_l3_pixel_acc": static_m["pixel_accuracy"],
-                "static_bit_error_rate": static_m["bit_error_rate"],
-                "static_exact_match": static_m["exact_match_percent"],
-                "static_mean_error_pixels": static_m["mean_error_pixels"],
-                "conf_s1": conf["s1"],
-                "conf_s2": conf["s2"],
-                "conf_l3": conf["l3"],
-                "weight_s1": weights["s1"],
-                "weight_s2": weights["s2"],
-                "weight_l3": weights["l3"],
-            }
-
-            # Save spatial map per update.
-            np.save(output_dir / "spatial_maps" / f"spatial_acc_update_{global_update:04d}.npy", spatial_accuracy_map(true_labels, ens_pred))
-            if side is not None:
-                save_spatial_map(
-                    spatial_accuracy_map(true_labels, ens_pred),
-                    side,
-                    output_dir / "spatial_maps" / f"spatial_acc_update_{global_update:04d}.png",
-                    f"Spatial accuracy, update {global_update}",
-                )
-
-            # Generate pseudo-labels using the same eval/current interval.
-            # If max_eval_samples_per_chunk is None, this is the full current chunk.
-            pseudo_indices, pseudo_labels, pseudo_conf, pseudo_info = select_pseudo_labels(
-                eval_indices,
-                ens_pred,
-                ens_prob,
-                cfg,
-            )
-            row.update(pseudo_info)
-            rows.append(row)
-
-            np.save(output_dir / "pseudo_labels" / f"pseudo_update_{global_update:04d}_indices.npy", pseudo_indices)
-            np.save(output_dir / "pseudo_labels" / f"pseudo_update_{global_update:04d}_labels.npy", pseudo_labels.astype(np.float32))
-            np.save(output_dir / "pseudo_labels" / f"pseudo_update_{global_update:04d}_confidence.npy", pseudo_conf.astype(np.float32))
-
-            # Keep examples for final visualization.
-            if global_update == 1:
-                saved_examples["first"] = (true_labels.copy(), ens_pred.copy(), pred_static.copy())
-            saved_examples["last"] = (true_labels.copy(), ens_pred.copy(), pred_static.copy())
-            if "worst_ensemble" not in saved_examples or row["ensemble_pixel_acc"] < saved_examples.get("worst_ensemble_acc", (1e9,))[0]:
-                saved_examples["worst_ensemble"] = (true_labels.copy(), ens_pred.copy(), pred_static.copy())
-                saved_examples["worst_ensemble_acc"] = (row["ensemble_pixel_acc"],)  # type: ignore[assignment]
-
-            # Update memory buffers.
-            long_memory.add(pseudo_indices, pseudo_labels, confidence=pseudo_conf)
-            short_memory.add(pseudo_indices, pseudo_labels, confidence=pseudo_conf)
-
-            metrics_df = pd.DataFrame(rows)
-            metrics_df.to_csv(output_dir / "dynamic_tracking_metrics.csv", index=False)
-            print(
-                f"ensemble={row['ensemble_pixel_acc']:.4f}%, "
-                f"static={row['static_l3_pixel_acc']:.4f}%, "
-                f"kept_pseudo={row['pseudo_keep_fraction']:.3f}"
-            )
-
-            # Self-supervised model update for subsequent intervals.
-            # L3: long memory with clean anchors + replayed pseudo labels.
-            l3_pseudo_idx, l3_pseudo_y = long_memory.sample(
-                int(cfg.l3_replay_pseudo_samples),
-                seed=cfg.seed + 1000 + global_update,
-                prefer_high_conf=True,
-            )
-            l3_train_idx = np.concatenate([anchor_idx, l3_pseudo_idx])
-            l3_train_y = np.concatenate([anchor_y, l3_pseudo_y])
-            fit_model(
-                models["l3"],
-                optimizers["l3"],
-                speckles,
-                l3_train_idx,
-                l3_train_y,
-                speckle_dim,
-                cfg,
-                device,
-                cfg.update_epochs,
-                f"update_{global_update:04d}_l3_long_memory",
-                output_dir,
-            )
-
-            # S1/S2: short memory, alternating rebuild to implement forgetting.
-            short_idx, short_y = short_memory.sample(
-                int(cfg.short_replay_samples),
-                seed=cfg.seed + 2000 + global_update,
-                prefer_high_conf=True,
-            )
-            if len(short_idx) > 0:
-                do_rebuild = (global_update % int(cfg.rebuild_interval) == 0)
-                if do_rebuild:
-                    rebuild_name = "s1" if rebuild_toggle % 2 == 0 else "s2"
-                    rebuild_toggle += 1
-                    print(f"Rebuilding {rebuild_name.upper()} from short-memory pseudo-labels")
-                    models[rebuild_name] = new_model(outsize, speckle_dim, cfg, device)
-                    models[rebuild_name].load_state_dict(copy.deepcopy(base.state_dict()))
-                    optimizers[rebuild_name] = make_optimizer(models[rebuild_name], cfg)
-                    fit_model(
-                        models[rebuild_name],
-                        optimizers[rebuild_name],
-                        speckles,
-                        short_idx,
-                        short_y,
-                        speckle_dim,
-                        cfg,
-                        device,
-                        cfg.rebuild_epochs,
-                        f"rebuild_{global_update:04d}_{rebuild_name}",
-                        output_dir,
-                    )
-
-                # Frequent short-memory update for both short experts.
-                for expert in ["s1", "s2"]:
-                    fit_model(
-                        models[expert],
-                        optimizers[expert],
-                        speckles,
-                        short_idx,
-                        short_y,
-                        speckle_dim,
-                        cfg,
-                        device,
-                        cfg.update_epochs,
-                        f"update_{global_update:04d}_{expert}_short_memory",
-                        output_dir,
-                    )
-
-            # Save rolling checkpoints.
-            torch.save(models["s1"].state_dict(), output_dir / "models" / "latest_s1.pt")
-            torch.save(models["s2"].state_dict(), output_dir / "models" / "latest_s2.pt")
-            torch.save(models["l3"].state_dict(), output_dir / "models" / "latest_l3.pt")
-
-    metrics_df = pd.DataFrame(rows)
-    metrics_df.to_csv(output_dir / "dynamic_tracking_metrics.csv", index=False)
-    metrics_df.to_excel(output_dir / "dynamic_tracking_metrics.xlsx", index=False)
-
-    torch.save(models["s1"].state_dict(), output_dir / "models" / "final_s1.pt")
-    torch.save(models["s2"].state_dict(), output_dir / "models" / "final_s2.pt")
-    torch.save(models["l3"].state_dict(), output_dir / "models" / "final_l3.pt")
-
-    # Plots and summary.
-    save_line_plots(metrics_df, output_dir)
-
-    for name, value in saved_examples.items():
-        if not isinstance(value, tuple):
-            continue
-        y_true, y_ens, y_static = value
-        save_examples(
-            y_true,
-            y_ens,
-            y_static,
-            side,
-            output_dir / "examples" / f"examples_{name}.png",
-            f"Representative examples: {name}",
-            int(cfg.example_count),
-        )
-
-    summary = {
-        "fixed_state_validation_ensemble_pixel_acc": float(fixed_row["ensemble_pixel_acc"]),
-        "dynamic_updates": int(len(metrics_df)),
-        "dynamic_ensemble_mean_pixel_acc": float(metrics_df["ensemble_pixel_acc"].mean()) if len(metrics_df) else float("nan"),
-        "dynamic_ensemble_min_pixel_acc": float(metrics_df["ensemble_pixel_acc"].min()) if len(metrics_df) else float("nan"),
-        "dynamic_ensemble_final_pixel_acc": float(metrics_df["ensemble_pixel_acc"].iloc[-1]) if len(metrics_df) else float("nan"),
-        "dynamic_static_mean_pixel_acc": float(metrics_df["static_l3_pixel_acc"].mean()) if len(metrics_df) else float("nan"),
-        "mean_gain_over_static_percent_points": float((metrics_df["ensemble_pixel_acc"] - metrics_df["static_l3_pixel_acc"]).mean()) if len(metrics_df) else float("nan"),
-        "output_dir": str(output_dir),
-    }
-    with open(output_dir / "summary.json", "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2, ensure_ascii=False)
-
-    print("=" * 90)
-    print("Stage 3.1 complete workflow finished.")
-    print(json.dumps(summary, indent=2, ensure_ascii=False))
-    print("saved:", output_dir)
-
-
-def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Stage 3.1 MMDN dynamic self-supervised input recovery."
-    )
-    parser.add_argument("--data-dir", type=str, default=CFG.data_dir, help="Dataset folder. If this folder has no .npy/.npz files, subfolders are searched automatically.")
-    parser.add_argument("--output-dir", type=str, default=CFG.output_dir, help="Output folder.")
-    parser.add_argument("--seed", type=int, default=CFG.seed)
-    parser.add_argument("--batch-size", type=int, default=CFG.batch_size)
-    parser.add_argument("--pretrain-epochs", type=int, default=CFG.pretrain_epochs)
-    parser.add_argument("--update-epochs", type=int, default=CFG.update_epochs)
-    parser.add_argument("--rebuild-epochs", type=int, default=CFG.rebuild_epochs)
-    parser.add_argument("--dynamic-chunk-size", type=int, default=-1, help="Online update chunk size. Use -1 to infer/default.")
-    parser.add_argument("--limit-dynamic-states", type=int, default=-1, help="Limit number of dynamic states. Use -1 for all.")
-    parser.add_argument("--pretrain-samples", type=int, default=-1, help="Limit fixed-state pretraining samples. Use -1 for all available.")
-    parser.add_argument("--samples-per-dynamic-state", type=int, default=-1, help="Limit samples per dynamic state. Use -1 for inferred/all available.")
-    parser.add_argument("--pseudo-conf-threshold", type=float, default=CFG.pseudo_conf_threshold)
-    parser.add_argument("--model-width", type=int, default=CFG.model_width)
-    parser.add_argument("--dropout", type=float, default=CFG.dropout)
-    parser.add_argument("--cpu", action="store_true", help="Accepted for command compatibility. Device is still selected inside main; set CUDA_VISIBLE_DEVICES=-1 if needed.")
-    return parser
-
-
-def config_from_args() -> Config:
-    args = build_arg_parser().parse_args()
-    cfg = copy.deepcopy(CFG)
-    cfg.data_dir = args.data_dir
-    cfg.output_dir = args.output_dir
-    cfg.seed = args.seed
-    cfg.batch_size = args.batch_size
-    cfg.pretrain_epochs = args.pretrain_epochs
-    cfg.update_epochs = args.update_epochs
-    cfg.rebuild_epochs = args.rebuild_epochs
-    cfg.pseudo_conf_threshold = args.pseudo_conf_threshold
-    cfg.model_width = args.model_width
-    cfg.dropout = args.dropout
-    if args.dynamic_chunk_size >= 0:
-        cfg.dynamic_chunk_size = args.dynamic_chunk_size
-    if args.limit_dynamic_states >= 0:
-        cfg.limit_dynamic_states = args.limit_dynamic_states
-    if args.pretrain_samples >= 0:
-        cfg.pretrain_samples = args.pretrain_samples
-    if args.samples_per_dynamic_state >= 0:
-        cfg.samples_per_dynamic_state = args.samples_per_dynamic_state
-    return cfg
+    print("=" * 100)
+    print(f"ALL DONE. Total elapsed time: {elapsed:.2f} min")
+    print("Main output folder:", output_dir)
+    print("Important files:")
+    for name in [
+        "fixed_state_pretrain_metrics.csv",
+        "dynamic_tracking_metrics.csv",
+        "dynamic_tracking_metrics.xlsx",
+        "dynamic_tracking_state_mean.csv",
+        "accuracy_over_drift.png",
+        "ensemble_weights.png",
+        "accuracy_state_average_static_vs_mmdn.png",
+        "exact_match_over_drift.png",
+        "mae_over_drift.png",
+        "pseudo_label_keep_fraction.png",
+        "recovery_examples_last_state.png",
+        "summary.json",
+        "run_log.txt",
+    ]:
+        path = output_dir / name
+        if path.exists():
+            print(" -", path)
+    print("=" * 100)
 
 
 if __name__ == "__main__":
-    main(config_from_args())
+    main()
